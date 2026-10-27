@@ -1,15 +1,16 @@
-use anyhow::Result;
-use chrono::{DateTime, Local};
-use clap::{Args, Parser, Subcommand};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, Local};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use dirs::config_local_dir;
-use humantime::Duration;
 use std::{
     fs::File,
     io::{BufReader, BufWriter},
     path::Path,
 };
-use task_tracke_rs::{RetrievalError, StatusFilter, StatusKind, Task, TaskFilter, TaskTree};
-use u4::U4 as u4;
+use task_tracke_rs::{
+    StatusFilter, StatusKind, Task, TaskEdit, TaskFilter, TaskId, TaskTree, parse_due_at,
+    parse_due_in, parse_name, parse_time_delta,
+};
 
 #[derive(Parser)]
 struct Cli {
@@ -21,6 +22,7 @@ struct Cli {
 enum Commands {
     List(ListArgs),
     Add(AddArgs),
+    Edit(EditArgs),
     Start(StartArgs),
     Complete(CompleteArgs),
     Delete(DeleteArgs),
@@ -31,7 +33,7 @@ enum Commands {
 #[derive(Args, Default)]
 struct ListArgs {
     #[arg(conflicts_with_all = ["status", "all", "overdue", "due_within"])]
-    id: Option<String>,
+    id: Option<TaskId>,
 
     /// Filter by status: incomplete, in-progress or complete, negated with a leading '!'.
     /// Defaults to !complete.
@@ -47,8 +49,8 @@ struct ListArgs {
     overdue: bool,
 
     /// Only show tasks due within the given duration, including overdue tasks.
-    #[arg(long)]
-    due_within: Option<Duration>,
+    #[arg(long, value_parser = parse_due_in)]
+    due_within: Option<DateTime<Local>>,
 }
 
 impl ListArgs {
@@ -65,7 +67,7 @@ impl ListArgs {
         let due_before = if self.overdue {
             Some(Local::now())
         } else {
-            parse_due(self.due_within)
+            self.due_within
         };
 
         TaskFilter { status, due_before }
@@ -73,58 +75,102 @@ impl ListArgs {
 }
 
 #[derive(Args)]
+#[command(group(ArgGroup::new("due_date").args(["due", "due_at"])))]
 struct AddArgs {
+    #[arg(value_parser = parse_name)]
     name: String,
 
-    #[arg(long)]
-    due: Option<Duration>,
+    /// Due in the given duration from now.
+    #[arg(long, value_parser = parse_due_in)]
+    due: Option<DateTime<Local>>,
 
-    #[arg(long)]
+    /// Due at the given local time: 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD' (midnight).
+    #[arg(long, value_parser = parse_due_at)]
+    due_at: Option<DateTime<Local>>,
+
+    /// Repeat by the given duration on completion. Requires a due date.
+    #[arg(long, requires = "due_date", value_parser = parse_time_delta)]
     repeat: Option<Duration>,
 }
 
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("changes")
+        .required(true)
+        .multiple(true)
+        .args(["name", "due", "due_at", "no_due", "repeat", "no_repeat"])
+))]
+#[command(group(ArgGroup::new("due_change").args(["due", "due_at", "no_due"])))]
+#[command(group(ArgGroup::new("repeat_change").args(["repeat", "no_repeat"])))]
+struct EditArgs {
+    id: TaskId,
+
+    #[arg(long, value_parser = parse_name)]
+    name: Option<String>,
+
+    /// Set the due date to the given duration from now.
+    #[arg(long, value_parser = parse_due_in)]
+    due: Option<DateTime<Local>>,
+
+    /// Set the due date to the given local time: 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD' (midnight).
+    #[arg(long, value_parser = parse_due_at)]
+    due_at: Option<DateTime<Local>>,
+
+    /// Remove the due date.
+    #[arg(long)]
+    no_due: bool,
+
+    /// Set the repeat duration.
+    #[arg(long, value_parser = parse_time_delta)]
+    repeat: Option<Duration>,
+
+    /// Remove the repeat.
+    #[arg(long)]
+    no_repeat: bool,
+}
+
+impl EditArgs {
+    fn edit(&self) -> TaskEdit {
+        let due = if self.no_due {
+            Some(None)
+        } else {
+            self.due_at.or(self.due).map(Some)
+        };
+
+        let repeat = if self.no_repeat {
+            Some(None)
+        } else {
+            self.repeat.map(Some)
+        };
+
+        TaskEdit {
+            name: self.name.clone(),
+            due,
+            repeat,
+        }
+    }
+}
+
+#[derive(Args)]
 struct StartArgs {
-    id: String,
+    id: TaskId,
 }
 
 #[derive(Args)]
 struct CompleteArgs {
-    id: String,
+    id: TaskId,
 }
 
 #[derive(Args)]
 struct DeleteArgs {
-    id: String,
+    id: TaskId,
 }
 
 #[derive(Args)]
 struct PostponeArgs {
-    id: String,
+    id: TaskId,
+    #[arg(value_parser = parse_time_delta)]
     duration: Duration,
-}
-
-fn parse_due(duration: Option<humantime::Duration>) -> Option<DateTime<Local>> {
-    duration.map(|d| {
-        let due = std::time::SystemTime::now() + *d;
-        DateTime::<Local>::from(due)
-    })
-}
-
-fn parse_duration(duration: Option<humantime::Duration>) -> Option<chrono::Duration> {
-    duration.and_then(|d| chrono::Duration::from_std(*d).ok())
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn parse_hex_string(s: &str) -> Result<Vec<u4>> {
-    s.chars()
-        .map(|c| {
-            c.to_digit(16)
-                .map(|d| u4::new(d as u8).unwrap())
-                .ok_or(RetrievalError::InvalidHexString)
-                .map_err(Into::into)
-        })
-        .collect()
 }
 
 /// Saves the task tree to the provided path.
@@ -171,90 +217,62 @@ pub fn load_task_tree<P: AsRef<Path>>(path: P) -> Result<TaskTree> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let mut task_tree = load_task_tree(
-        config_local_dir()
-            .expect("Unable to determine local configuration directory.")
-            .join("task-tracke-rs/tasks.json"),
-    )?;
+    let path = config_local_dir()
+        .context("Unable to determine local configuration directory.")?
+        .join("task-tracke-rs/tasks.json");
+
+    let mut task_tree = load_task_tree(&path)?;
 
     let default_filter = ListArgs::default().filter();
 
     match &cli.command.unwrap_or(Commands::List(ListArgs::default())) {
         Commands::List(args) => match &args.id {
-            Some(id) => print!("{}", task_tree.get_task(&parse_hex_string(id)?)?),
+            Some(id) => print!("{}", task_tree.get_task(id.as_ref())?),
             None => print!("{}", task_tree.filtered(&args.filter())),
         },
         Commands::Add(args) => {
             task_tree.add_task(Task::new(
                 args.name.clone(),
-                parse_due(args.due),
-                parse_duration(args.repeat),
-            ));
-            save_task_tree(
-                &task_tree,
-                config_local_dir()
-                    .unwrap()
-                    .join("task-tracke-rs/tasks.json"),
-            )?;
+                args.due_at.or(args.due),
+                args.repeat,
+            )?);
+            save_task_tree(&task_tree, &path)?;
+            print!("{}", task_tree.filtered(&default_filter));
+        }
+        Commands::Edit(args) => {
+            task_tree
+                .get_task_mut(args.id.as_ref())?
+                .edit(args.edit())?;
+            save_task_tree(&task_tree, &path)?;
             print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Start(args) => {
-            task_tree
-                .get_task_mut(&parse_hex_string(&args.id)?)?
-                .start_task()?;
-            save_task_tree(
-                &task_tree,
-                config_local_dir()
-                    .unwrap()
-                    .join("task-tracke-rs/tasks.json"),
-            )?;
+            task_tree.get_task_mut(args.id.as_ref())?.start_task()?;
+            save_task_tree(&task_tree, &path)?;
             print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Complete(args) => {
-            if let Some(next) = task_tree
-                .get_task_mut(&parse_hex_string(&args.id)?)?
-                .complete_task()?
-            {
+            if let Some(next) = task_tree.get_task_mut(args.id.as_ref())?.complete_task()? {
                 task_tree.add_task(next);
             }
-            save_task_tree(
-                &task_tree,
-                config_local_dir()
-                    .unwrap()
-                    .join("task-tracke-rs/tasks.json"),
-            )?;
+            save_task_tree(&task_tree, &path)?;
             print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Delete(args) => {
-            task_tree.delete_task(&parse_hex_string(&args.id)?)?;
-            save_task_tree(
-                &task_tree,
-                config_local_dir()
-                    .unwrap()
-                    .join("task-tracke-rs/tasks.json"),
-            )?;
+            task_tree.delete_task(args.id.as_ref())?;
+            save_task_tree(&task_tree, &path)?;
             print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Postpone(args) => {
             task_tree
-                .get_task_mut(&parse_hex_string(&args.id)?)?
-                .postpone_task(parse_duration(Some(args.duration)).unwrap())?;
-            save_task_tree(
-                &task_tree,
-                config_local_dir()
-                    .unwrap()
-                    .join("task-tracke-rs/tasks.json"),
-            )?;
+                .get_task_mut(args.id.as_ref())?
+                .postpone_task(args.duration)?;
+            save_task_tree(&task_tree, &path)?;
             print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Purge => {
             task_tree.purge()?;
-            save_task_tree(
-                &task_tree,
-                config_local_dir()
-                    .unwrap()
-                    .join("task-tracke-rs/tasks.json"),
-            )?;
+            save_task_tree(&task_tree, &path)?;
             print!("{}", task_tree.filtered(&default_filter));
         }
     }

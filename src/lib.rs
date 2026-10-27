@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Local};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone};
 use rand::random_range;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,6 +30,7 @@ pub struct Task {
     pub repeat: Option<Duration>,
 }
 
+#[derive(Debug)]
 pub struct TaskId(Vec<U4>);
 
 #[derive(Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
@@ -50,6 +51,16 @@ pub enum StatusKind {
 pub enum StatusFilter {
     Is(StatusKind),
     Not(StatusKind),
+}
+
+/// A set of changes to apply to a task. Fields left as `None` are unchanged.
+#[derive(Default)]
+pub struct TaskEdit {
+    pub name: Option<String>,
+    /// `Some(None)` clears the due date.
+    pub due: Option<Option<DateTime<Local>>>,
+    /// `Some(None)` clears the repeat.
+    pub repeat: Option<Option<Duration>>,
 }
 
 #[derive(Default)]
@@ -74,18 +85,120 @@ pub enum StatusError {
 }
 
 #[derive(Debug, Error)]
-pub enum RetrievalError {
-    #[error("No such id.")]
-    NoSuchId,
-    #[error("Invalid hex string.")]
-    InvalidHexString,
+pub enum InvalidTaskError {
+    #[error("A repeating task must have a due date.")]
+    RepeatWithoutDueDate,
+    #[error(transparent)]
+    EmptyName(#[from] EmptyNameError),
 }
+
+#[derive(Debug, Error)]
+#[error("Task name cannot be empty.")]
+pub struct EmptyNameError;
+
+#[derive(Debug, Error)]
+pub enum RetrievalError {
+    #[error("No task with id '{0}'.")]
+    NoSuchId(TaskId),
+}
+
+#[derive(Debug, Error)]
+#[error("Invalid task id '{0}'. Expected one or more hexadecimal digits, e.g. '3a'.")]
+pub struct ParseTaskIdError(String);
 
 #[derive(Debug, Error)]
 #[error(
     "Invalid status filter '{0}'. Expected incomplete, in-progress or complete, optionally prefixed with '!'."
 )]
 pub struct ParseStatusFilterError(String);
+
+#[derive(Debug, Error)]
+pub enum ParseDueAtError {
+    #[error("Invalid date '{0}'. Expected 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'.")]
+    InvalidFormat(String),
+    #[error("'{0}' does not exist in the local timezone.")]
+    NonexistentLocalTime(String),
+}
+
+#[derive(Debug, Error)]
+pub enum ParseTimeDeltaError {
+    #[error("Invalid duration '{0}' ({1}). Try e.g. '30m', '2h' or '1w 2d'.")]
+    Invalid(String, humantime::DurationError),
+    #[error("Duration '{0}' is too large.")]
+    TooLarge(String),
+}
+
+/// Parses a human-readable duration such as `1w` or `2h 30m`.
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - The input is not a valid duration.
+/// - The duration is too large to represent.
+pub fn parse_time_delta(s: &str) -> Result<Duration, ParseTimeDeltaError> {
+    let duration =
+        humantime::parse_duration(s).map_err(|e| ParseTimeDeltaError::Invalid(s.to_owned(), e))?;
+    Duration::from_std(duration).map_err(|_| ParseTimeDeltaError::TooLarge(s.to_owned()))
+}
+
+/// Parses a human-readable duration and returns the time that far from now.
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - The input is not a valid duration.
+/// - The resulting time is too far in the future to represent.
+pub fn parse_due_in(s: &str) -> Result<DateTime<Local>, ParseTimeDeltaError> {
+    Local::now()
+        .checked_add_signed(parse_time_delta(s)?)
+        .ok_or_else(|| ParseTimeDeltaError::TooLarge(s.to_owned()))
+}
+
+/// Parses a task name, rejecting names that are empty or only whitespace.
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - The name is empty or only whitespace.
+pub fn parse_name(s: &str) -> Result<String, EmptyNameError> {
+    validate_name(s)?;
+    Ok(s.to_owned())
+}
+
+/// Checks that a task name is not empty or only whitespace.
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - The name is empty or only whitespace.
+pub fn validate_name(s: &str) -> Result<(), EmptyNameError> {
+    if s.trim().is_empty() {
+        Err(EmptyNameError)
+    } else {
+        Ok(())
+    }
+}
+
+/// Parses an absolute local date and time, as `YYYY-MM-DD HH:MM` or `YYYY-MM-DD` (midnight).
+/// Times that occur twice due to a daylight saving change resolve to the earlier one.
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - The input matches neither format.
+/// - The time is skipped in the local timezone due to a daylight saving change.
+pub fn parse_due_at(s: &str) -> Result<DateTime<Local>, ParseDueAtError> {
+    let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
+        .or_else(|_| {
+            NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.and_time(chrono::NaiveTime::MIN))
+        })
+        .map_err(|_| ParseDueAtError::InvalidFormat(s.to_owned()))?;
+
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .ok_or_else(|| ParseDueAtError::NonexistentLocalTime(s.to_owned()))
+}
 
 impl TaskTree {
     #[must_use]
@@ -134,39 +247,23 @@ impl TaskTree {
     /// This function will return an error if:
     /// - The provided ID does not exist.
     pub fn delete_task_inner(&mut self, id: &[U4]) -> Result<Task, RetrievalError> {
-        let Some((&index, rest)) = id.split_first() else {
-            return Err(RetrievalError::NoSuchId);
-        };
+        self.remove(id)
+            .ok_or_else(|| RetrievalError::no_such_id(id))
+    }
 
-        let index = usize::from(index);
+    fn remove(&mut self, id: &[U4]) -> Option<Task> {
+        let (&index, rest) = id.split_first()?;
+        let slot = &mut self.children[usize::from(index)];
 
-        let Some(node) = self.children.get(index).and_then(Option::as_ref) else {
-            return Err(RetrievalError::NoSuchId);
-        };
-
-        match node {
-            TaskTreeNode::Task(_) => {
-                if !rest.is_empty() {
-                    return Err(RetrievalError::NoSuchId);
-                }
-
-                match self.children[index].take() {
-                    Some(TaskTreeNode::Task(task)) => Ok(task),
-                    Some(node) => {
-                        self.children[index] = Some(node);
-                        Err(RetrievalError::NoSuchId)
-                    }
-                    None => Err(RetrievalError::NoSuchId),
-                }
-            }
-
-            TaskTreeNode::Tree(_) => {
-                let Some(TaskTreeNode::Tree(tree)) = self.children[index].as_mut() else {
-                    return Err(RetrievalError::NoSuchId);
+        match slot {
+            Some(TaskTreeNode::Task(_)) if rest.is_empty() => {
+                let Some(TaskTreeNode::Task(task)) = slot.take() else {
+                    unreachable!("Slot was just matched as a task.");
                 };
-
-                tree.delete_task_inner(rest)
+                Some(task)
             }
+            Some(TaskTreeNode::Tree(tree)) if !rest.is_empty() => tree.remove(rest),
+            _ => None,
         }
     }
 
@@ -201,15 +298,16 @@ impl TaskTree {
     /// This function will return an error if:
     /// - There is no task with the provided ID.
     pub fn get_task(&self, id: &[U4]) -> Result<&Task, RetrievalError> {
-        match (
-            &self.children[*id.first().ok_or(RetrievalError::NoSuchId)? as usize],
-            id.len(),
-        ) {
-            (Some(TaskTreeNode::Task(task)), 1) => Ok(task),
-            (Some(TaskTreeNode::Tree(_)), 1) | (Some(TaskTreeNode::Task(_)) | None, _) => {
-                Err(RetrievalError::NoSuchId)
-            }
-            (Some(TaskTreeNode::Tree(tree)), _) => tree.get_task(&id[1..]),
+        self.find(id).ok_or_else(|| RetrievalError::no_such_id(id))
+    }
+
+    fn find(&self, id: &[U4]) -> Option<&Task> {
+        let (&index, rest) = id.split_first()?;
+
+        match (self.children[usize::from(index)].as_ref()?, rest.is_empty()) {
+            (TaskTreeNode::Task(task), true) => Some(task),
+            (TaskTreeNode::Tree(tree), false) => tree.find(rest),
+            _ => None,
         }
     }
 
@@ -220,15 +318,17 @@ impl TaskTree {
     /// This function will return an error if:
     /// - There is no task with the provided ID.
     pub fn get_task_mut(&mut self, id: &[U4]) -> Result<&mut Task, RetrievalError> {
-        match (
-            &mut self.children[*id.first().ok_or(RetrievalError::NoSuchId)? as usize],
-            id.len(),
-        ) {
-            (Some(TaskTreeNode::Task(task)), 1) => Ok(task),
-            (Some(TaskTreeNode::Tree(_)), 1) | (Some(TaskTreeNode::Task(_)) | None, _) => {
-                Err(RetrievalError::NoSuchId)
-            }
-            (Some(TaskTreeNode::Tree(tree)), _) => tree.get_task_mut(&id[1..]),
+        self.find_mut(id)
+            .ok_or_else(|| RetrievalError::no_such_id(id))
+    }
+
+    fn find_mut(&mut self, id: &[U4]) -> Option<&mut Task> {
+        let (&index, rest) = id.split_first()?;
+
+        match (self.children[usize::from(index)].as_mut()?, rest.is_empty()) {
+            (TaskTreeNode::Task(task), true) => Some(task),
+            (TaskTreeNode::Tree(tree), false) => tree.find_mut(rest),
+            _ => None,
         }
     }
 
@@ -335,7 +435,9 @@ impl TaskTree {
     ///
     /// # Errors
     ///
-    /// This function will return an error if .
+    /// This function will return an error if:
+    /// - A completed task cannot be found while deleting it. This indicates a bug, as the ids
+    ///   are collected from the tree immediately beforehand.
     pub fn purge(&mut self) -> Result<Vec<Task>, RetrievalError> {
         let ids: Vec<TaskId> = self
             .collect_tasks(&TaskId::new())
@@ -362,19 +464,31 @@ impl Default for TaskTree {
 }
 
 impl Task {
-    #[must_use]
+    /// Creates a new incomplete task.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The name is empty or only whitespace.
+    /// - The task repeats without a due date.
     pub fn new(
         name: String,
         due_date: Option<DateTime<Local>>,
         recurrence: Option<Duration>,
-    ) -> Task {
-        Task {
+    ) -> Result<Task, InvalidTaskError> {
+        validate_name(&name)?;
+
+        if recurrence.is_some() && due_date.is_none() {
+            return Err(InvalidTaskError::RepeatWithoutDueDate);
+        }
+
+        Ok(Task {
             creation_date: Local::now(),
             due: due_date,
             name,
             status: TaskStatus::Incomplete,
             repeat: recurrence,
-        }
+        })
     }
 
     /// Sets `status` to `InProgress`.
@@ -404,11 +518,15 @@ impl Task {
     /// - The task is already completed.
     pub fn complete_task(&mut self) -> Result<Option<Task>, StatusError> {
         let next = if let (Some(recurrence), Some(due_date)) = (self.repeat, self.due) {
-            Some(Task::new(
-                self.name.clone(),
-                Some(due_date + recurrence),
-                self.repeat,
-            ))
+            // Built directly rather than via `Task::new`, so that tasks saved before
+            // validation existed can still be completed.
+            Some(Task {
+                creation_date: Local::now(),
+                due: Some(due_date + recurrence),
+                name: self.name.clone(),
+                status: TaskStatus::Incomplete,
+                repeat: self.repeat,
+            })
         } else {
             None
         };
@@ -441,6 +559,33 @@ impl Task {
         } else {
             Err(StatusError::PostponedTaskWithNoDueDate)
         }
+    }
+
+    /// Applies the given changes to the task. The task is left unchanged if the edit is rejected.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The edited task would repeat without a due date.
+    /// - The new name is empty or only whitespace.
+    pub fn edit(&mut self, edit: TaskEdit) -> Result<(), InvalidTaskError> {
+        if let Some(name) = &edit.name {
+            validate_name(name)?;
+        }
+        let due = edit.due.unwrap_or(self.due);
+        let repeat = edit.repeat.unwrap_or(self.repeat);
+
+        if repeat.is_some() && due.is_none() {
+            return Err(InvalidTaskError::RepeatWithoutDueDate);
+        }
+
+        if let Some(name) = edit.name {
+            self.name = name;
+        }
+        self.due = due;
+        self.repeat = repeat;
+
+        Ok(())
     }
 }
 
@@ -531,9 +676,25 @@ impl Clone for TaskId {
     }
 }
 
-impl From<std::num::TryFromIntError> for RetrievalError {
-    fn from(_: std::num::TryFromIntError) -> Self {
-        RetrievalError::InvalidHexString
+impl FromStr for TaskId {
+    type Err = ParseTaskIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ParseTaskIdError(s.to_owned()));
+        }
+
+        s.chars()
+            .map(|c| c.to_digit(16).and_then(|d| U4::try_from(d).ok()))
+            .collect::<Option<Vec<U4>>>()
+            .map(Self)
+            .ok_or_else(|| ParseTaskIdError(s.to_owned()))
+    }
+}
+
+impl RetrievalError {
+    fn no_such_id(id: &[U4]) -> Self {
+        RetrievalError::NoSuchId(TaskId(id.to_vec()))
     }
 }
 
