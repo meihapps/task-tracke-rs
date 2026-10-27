@@ -1,6 +1,6 @@
 [package]
 name = "task-tracke-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A command-line task tracker with short ids, repeating tasks, and undo and redo."
 license = "MIT OR Apache-2.0"
