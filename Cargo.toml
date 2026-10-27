@@ -2,6 +2,12 @@
 name = "task-tracke-rs"
 version = "0.1.0"
 edition = "2024"
+description = "A command-line task tracker with short ids, repeating tasks, and undo and redo."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/meihapps/task-tracke-rs"
+readme = "README.md"
+keywords = ["todo", "task", "cli", "undo", "productivity"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -14,3 +20,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.19"
 u4 = { version = "0.1.2", features = ["serde"] }
+
+[[bin]]
+name = "todo"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,3 +1,10 @@
+//! The task tree behind the `todo` command-line task tracker.
+//!
+//! Tasks live in a [`TaskTree`], addressed by short hexadecimal [`TaskId`]s. Every change to
+//! the tree is an [`Effect`], and applying an effect returns the effect that reverses it.
+//! Commands such as [`TaskTree::add_task`] return a [`Record`] of those inverses, which
+//! [`TaskTree::apply_record`] uses to undo the command, returning a record that redoes it.
+
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone};
 use rand::random_range;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -76,7 +83,7 @@ pub enum Effect {
 #[serde(transparent)]
 pub struct Record(Vec<Effect>);
 
-#[derive(Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
 pub enum TaskStatus {
     InProgress(DateTime<Local>),
     Incomplete,
@@ -202,7 +209,7 @@ pub enum ParseDueAtError {
 
 #[derive(Debug, Error)]
 pub enum ParseTimeDeltaError {
-    #[error("Invalid duration '{0}' ({1}). Try e.g. '30m', '2h' or '1w 2d'.")]
+    #[error("Invalid duration '{0}' ({1}). Try e.g. '30m', '2h' or '1w2d'.")]
     Invalid(String, humantime::DurationError),
     #[error("Duration '{0}' is too large.")]
     TooLarge(String),
@@ -219,6 +226,40 @@ pub fn parse_time_delta(s: &str) -> Result<Duration, ParseTimeDeltaError> {
     let duration =
         humantime::parse_duration(s).map_err(|e| ParseTimeDeltaError::Invalid(s.to_owned(), e))?;
     Duration::from_std(duration).map_err(|_| ParseTimeDeltaError::TooLarge(s.to_owned()))
+}
+
+/// Formats a duration in words, largest units first, e.g. `1 week 2 days`.
+/// Months and years are as long as [`parse_time_delta`] takes them to be. Anything below a
+/// second is dropped.
+#[must_use]
+pub fn format_time_delta(duration: Duration) -> String {
+    const UNITS: [(&str, u64); 7] = [
+        ("year", 31_557_600),
+        ("month", 2_630_016),
+        ("week", 604_800),
+        ("day", 86_400),
+        ("hour", 3_600),
+        ("minute", 60),
+        ("second", 1),
+    ];
+
+    let mut remaining = duration.num_seconds().unsigned_abs();
+    let mut parts = Vec::new();
+
+    for (unit, seconds) in UNITS {
+        let count = remaining / seconds;
+        remaining %= seconds;
+        if count > 0 {
+            let plural = if count == 1 { "" } else { "s" };
+            parts.push(format!("{count} {unit}{plural}"));
+        }
+    }
+
+    if parts.is_empty() {
+        "0 seconds".to_owned()
+    } else {
+        parts.join(" ")
+    }
 }
 
 /// Parses a human-readable duration and returns the time that far from now.
@@ -381,15 +422,14 @@ impl TaskTree {
     /// This function will return an error if:
     /// - Any effect is rejected. Effects applied before it are not rolled back.
     pub fn apply_record(&mut self, record: Record) -> Result<Record, EffectError> {
-        let mut inverse = record
+        // Each effect applied here is a step of its own, so the inverses are already in step order.
+        record
             .0
             .into_iter()
             .rev()
             .map(|effect| self.apply(effect))
-            .collect::<Result<Vec<_>, _>>()?;
-        // The inverses were produced last step first, but a record lists steps in the order they happened.
-        inverse.reverse();
-        Ok(Record(inverse))
+            .collect::<Result<_, _>>()
+            .map(Record)
     }
 
     /// Applies an effect, returning the effect that reverses it.
@@ -1028,9 +1068,7 @@ impl fmt::Display for Task {
             self.status,
             self.creation_date,
             self.due.map_or("n/a".to_owned(), |x| x.to_rfc2822()),
-            self.repeat
-                .and_then(|x| Some(humantime::Duration::from(x.to_std().ok()?).to_string()))
-                .unwrap_or("n/a".to_owned())
+            self.repeat.map_or("n/a".to_owned(), format_time_delta)
         )
     }
 }
@@ -1059,5 +1097,1066 @@ impl fmt::Display for TaskStatus {
                 },
             }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(s: &str) -> TaskId {
+        s.parse().unwrap()
+    }
+
+    fn u4(n: u8) -> U4 {
+        U4::try_from(n).unwrap()
+    }
+
+    fn at(hour: u32) -> DateTime<Local> {
+        Local.with_ymd_and_hms(2030, 1, 1, hour, 0, 0).unwrap()
+    }
+
+    fn task(name: &str) -> Task {
+        Task::new(name.to_owned(), None, None).unwrap()
+    }
+
+    fn repeating(name: &str) -> Task {
+        Task::new(name.to_owned(), Some(at(9)), Some(Duration::days(7))).unwrap()
+    }
+
+    /// The whole tree, including every task field, for exact comparisons.
+    fn snapshot(tree: &TaskTree) -> String {
+        serde_json::to_string(tree).unwrap()
+    }
+
+    /// Every task as `(id, name)`, sorted by id.
+    fn layout(tree: &TaskTree) -> Vec<(String, String)> {
+        let mut tasks: Vec<_> = tree
+            .collect_tasks(&TaskId::new())
+            .into_iter()
+            .map(|(id, task)| (id.to_string(), task.name.clone()))
+            .collect();
+        tasks.sort();
+        tasks
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|&(id, name)| (id.to_owned(), name.to_owned()))
+            .collect()
+    }
+
+    /// Asserts that every subtree below the root has at least two children.
+    fn assert_compact(tree: &TaskTree, is_root: bool) {
+        let children: Vec<_> = tree.children.iter().flatten().collect();
+        assert!(
+            is_root || children.len() >= 2,
+            "subtree with fewer than two children"
+        );
+        for child in children {
+            if let TaskTreeNode::Tree(subtree) = child {
+                assert_compact(subtree, false);
+            }
+        }
+    }
+
+    fn insert(tree: &mut TaskTree, at: &str, name: &str, displaced: Option<u8>) -> Effect {
+        tree.apply(Effect::Insert {
+            id: id(at),
+            task: task(name),
+            displaced: displaced.map(u4),
+        })
+        .unwrap()
+    }
+
+    /// Builds `3: tree { 1: a, 2: b, 7: tree { 0: c, 5: d } }` and `9: e`.
+    fn sample_tree() -> TaskTree {
+        let mut tree = TaskTree::new();
+        insert(&mut tree, "3", "a", None);
+        insert(&mut tree, "32", "b", Some(1));
+        insert(&mut tree, "37", "c", None);
+        insert(&mut tree, "375", "d", Some(0));
+        insert(&mut tree, "9", "e", None);
+        tree
+    }
+
+    /// Applies an effect, then its inverse, then the inverse of that, checking each step
+    /// lands back on the right state.
+    fn assert_round_trip(tree: &mut TaskTree, effect: Effect) {
+        let before = snapshot(tree);
+        let inverse = tree.apply(effect).unwrap();
+        let after = snapshot(tree);
+        assert_ne!(before, after, "effect changed nothing");
+
+        let redo = tree.apply(inverse).unwrap();
+        assert_eq!(snapshot(tree), before, "inverse did not restore the tree");
+        tree.apply(redo).unwrap();
+        assert_eq!(snapshot(tree), after, "redo did not restore the change");
+    }
+
+    /// Applies a record, then its inverse, checking both directions.
+    fn assert_record_round_trip(tree: &mut TaskTree, before: &str, record: Record) {
+        let after = snapshot(tree);
+        let redo = tree.apply_record(record).unwrap();
+        assert_eq!(snapshot(tree), before, "undo did not restore the tree");
+        let undo = tree.apply_record(redo).unwrap();
+        assert_eq!(snapshot(tree), after, "redo did not restore the change");
+        tree.apply_record(undo).unwrap();
+        assert_eq!(
+            snapshot(tree),
+            before,
+            "second undo did not restore the tree"
+        );
+    }
+
+    // Parsing.
+
+    #[test]
+    fn task_id_parses_hex_digits() {
+        assert_eq!(id("3aF").as_ref(), &[u4(3), u4(10), u4(15)]);
+        assert_eq!(id("3aF").to_string(), "3af");
+    }
+
+    #[test]
+    fn task_id_rejects_empty_and_non_hex() {
+        assert!("".parse::<TaskId>().is_err());
+        assert!("3g".parse::<TaskId>().is_err());
+        assert!("-1".parse::<TaskId>().is_err());
+    }
+
+    #[test]
+    fn task_id_display_respects_padding() {
+        assert_eq!(format!("{:<4}|", id("3a")), "3a  |");
+    }
+
+    #[test]
+    fn task_id_serialises_as_hex_string() {
+        assert_eq!(serde_json::to_string(&id("3a")).unwrap(), r#""3a""#);
+        let parsed: TaskId = serde_json::from_str(r#""3a""#).unwrap();
+        assert_eq!(parsed.as_ref(), id("3a").as_ref());
+        assert!(serde_json::from_str::<TaskId>(r#""zz""#).is_err());
+    }
+
+    #[test]
+    fn parse_name_rejects_blank_names() {
+        assert_eq!(parse_name(" x ").unwrap(), " x ");
+        assert!(parse_name("").is_err());
+        assert!(parse_name(" \t\n").is_err());
+    }
+
+    #[test]
+    fn parse_due_at_accepts_date_and_date_time() {
+        assert_eq!(
+            parse_due_at("2030-01-01").unwrap(),
+            Local.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()
+        );
+        assert_eq!(parse_due_at("2030-01-01 09:00").unwrap(), at(9));
+    }
+
+    #[test]
+    fn parse_due_at_rejects_other_formats() {
+        for input in ["", "2030-13-01", "01/01/2030", "2030-01-01 9am"] {
+            assert!(
+                matches!(parse_due_at(input), Err(ParseDueAtError::InvalidFormat(_))),
+                "{input:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_time_delta_accepts_compound_durations() {
+        assert_eq!(parse_time_delta("30m").unwrap(), Duration::minutes(30));
+        assert_eq!(parse_time_delta("1w 2d").unwrap(), Duration::days(9));
+        assert_eq!(parse_time_delta("1w2d").unwrap(), Duration::days(9));
+        assert!(matches!(
+            parse_time_delta("soon"),
+            Err(ParseTimeDeltaError::Invalid(..))
+        ));
+    }
+
+    #[test]
+    fn format_time_delta_uses_spaced_words() {
+        assert_eq!(format_time_delta(Duration::days(1)), "1 day");
+        assert_eq!(format_time_delta(Duration::days(2)), "2 days");
+        assert_eq!(format_time_delta(Duration::days(9)), "1 week 2 days");
+        assert_eq!(
+            format_time_delta(Duration::hours(25) + Duration::seconds(61)),
+            "1 day 1 hour 1 minute 1 second"
+        );
+        assert_eq!(format_time_delta(Duration::milliseconds(500)), "0 seconds");
+    }
+
+    #[test]
+    fn format_time_delta_matches_parsed_units() {
+        for (input, expected) in [
+            ("1d", "1 day"),
+            ("1w", "1 week"),
+            ("3w", "3 weeks"),
+            ("1month", "1 month"),
+            ("2months", "2 months"),
+            ("1y", "1 year"),
+            (
+                "1y 1month 1w 1d 1h 1m 1s",
+                "1 year 1 month 1 week 1 day 1 hour 1 minute 1 second",
+            ),
+        ] {
+            assert_eq!(
+                format_time_delta(parse_time_delta(input).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn task_details_show_repeat_in_words() {
+        let details = repeating("x").to_string();
+        assert!(details.contains("repeat:  1 week"), "{details}");
+        assert!(task("x").to_string().contains("repeat:  n/a"));
+    }
+
+    #[test]
+    fn parse_due_in_is_relative_to_now() {
+        let before = Local::now();
+        let due = parse_due_in("1h").unwrap();
+        assert!(due >= before + Duration::hours(1));
+        assert!(due <= Local::now() + Duration::hours(1));
+    }
+
+    #[test]
+    fn status_filter_parses_kinds_and_negation() {
+        assert!(matches!(
+            "complete".parse(),
+            Ok(StatusFilter::Is(StatusKind::Complete))
+        ));
+        assert!(matches!(
+            "!in-progress".parse(),
+            Ok(StatusFilter::Not(StatusKind::InProgress))
+        ));
+        assert!("done".parse::<StatusFilter>().is_err());
+        assert!("!!complete".parse::<StatusFilter>().is_err());
+    }
+
+    #[test]
+    fn task_filter_combines_status_and_due() {
+        let mut due_soon = Task::new("x".to_owned(), Some(at(9)), None).unwrap();
+        let no_due = task("y");
+
+        let filter = TaskFilter {
+            status: Some(StatusFilter::Not(StatusKind::Complete)),
+            due_before: Some(at(10)),
+        };
+        assert!(filter.matches(&due_soon));
+        assert!(
+            !filter.matches(&no_due),
+            "tasks without a due date never match"
+        );
+
+        due_soon.complete(at(9)).unwrap();
+        assert!(!filter.matches(&due_soon));
+        assert!(TaskFilter::default().matches(&due_soon));
+    }
+
+    // Task state.
+
+    #[test]
+    fn new_task_validates_name_and_repeat() {
+        assert!(matches!(
+            Task::new(" ".to_owned(), None, None),
+            Err(InvalidTaskError::EmptyName(_))
+        ));
+        assert!(matches!(
+            Task::new("x".to_owned(), None, Some(Duration::days(1))),
+            Err(InvalidTaskError::RepeatWithoutDueDate)
+        ));
+        assert_eq!(task("x").status, TaskStatus::Incomplete);
+    }
+
+    #[test]
+    fn start_and_unstart_round_trip() {
+        let mut task = task("x");
+        task.start(at(9)).unwrap();
+        assert_eq!(task.status, TaskStatus::InProgress(at(9)));
+        assert!(matches!(
+            task.start(at(10)),
+            Err(StatusError::TaskAlreadyStarted)
+        ));
+
+        assert_eq!(task.unstart().unwrap(), at(9));
+        assert_eq!(task.status, TaskStatus::Incomplete);
+        assert!(matches!(
+            task.unstart(),
+            Err(StatusError::TaskNotInProgress)
+        ));
+    }
+
+    #[test]
+    fn complete_and_uncomplete_from_incomplete() {
+        let mut task = task("x");
+        task.complete(at(10)).unwrap();
+        assert_eq!(task.status, TaskStatus::Complete(None, at(10)));
+        assert!(matches!(
+            task.complete(at(11)),
+            Err(StatusError::TaskAlreadyCompleted)
+        ));
+        assert!(matches!(
+            task.start(at(11)),
+            Err(StatusError::TaskAlreadyCompleted)
+        ));
+
+        assert_eq!(task.uncomplete().unwrap(), at(10));
+        assert_eq!(task.status, TaskStatus::Incomplete);
+        assert!(matches!(
+            task.uncomplete(),
+            Err(StatusError::TaskNotCompleted)
+        ));
+    }
+
+    #[test]
+    fn complete_and_uncomplete_from_in_progress() {
+        let mut task = task("x");
+        task.start(at(9)).unwrap();
+        task.complete(at(10)).unwrap();
+        assert_eq!(task.status, TaskStatus::Complete(Some(at(9)), at(10)));
+
+        task.uncomplete().unwrap();
+        assert_eq!(task.status, TaskStatus::InProgress(at(9)));
+    }
+
+    #[test]
+    fn next_occurrence_only_for_repeating_tasks() {
+        assert!(task("x").next_occurrence().is_none());
+
+        let next = repeating("x").next_occurrence().unwrap();
+        assert_eq!(next.name, "x");
+        assert_eq!(next.due, Some(at(9) + Duration::days(7)));
+        assert_eq!(next.repeat, Some(Duration::days(7)));
+        assert_eq!(next.status, TaskStatus::Incomplete);
+    }
+
+    #[test]
+    fn postponed_due_is_relative_to_later_of_due_and_now() {
+        let future = Local::now() + Duration::days(30);
+        let task = Task::new("x".to_owned(), Some(future), None).unwrap();
+        assert_eq!(
+            task.postponed_due(Duration::hours(2)).unwrap(),
+            future + Duration::hours(2)
+        );
+
+        let past = Local::now() - Duration::days(30);
+        let task = Task::new("x".to_owned(), Some(past), None).unwrap();
+        let before = Local::now();
+        let due = task.postponed_due(Duration::hours(2)).unwrap();
+        assert!(due >= before + Duration::hours(2));
+
+        assert!(matches!(
+            self::task("x").postponed_due(Duration::hours(2)),
+            Err(StatusError::PostponedTaskWithNoDueDate)
+        ));
+    }
+
+    #[test]
+    fn edit_returns_inverse_of_changed_fields_only() {
+        let mut task = repeating("old");
+        let inverse = task
+            .edit(TaskEdit {
+                name: Some("new".to_owned()),
+                due: Some(Some(at(12))),
+                repeat: None,
+            })
+            .unwrap();
+
+        assert_eq!(task.name, "new");
+        assert_eq!(task.due, Some(at(12)));
+        assert_eq!(inverse.name.as_deref(), Some("old"));
+        assert_eq!(inverse.due, Some(Some(at(9))));
+        assert!(inverse.repeat.is_none());
+
+        task.edit(inverse).unwrap();
+        assert_eq!(task.name, "old");
+        assert_eq!(task.due, Some(at(9)));
+        assert_eq!(task.repeat, Some(Duration::days(7)));
+    }
+
+    #[test]
+    fn edit_can_clear_fields_and_restore_them() {
+        let mut task = repeating("x");
+        let inverse = task
+            .edit(TaskEdit {
+                due: Some(None),
+                repeat: Some(None),
+                ..TaskEdit::default()
+            })
+            .unwrap();
+        assert_eq!((task.due, task.repeat), (None, None));
+
+        task.edit(inverse).unwrap();
+        assert_eq!(task.due, Some(at(9)));
+        assert_eq!(task.repeat, Some(Duration::days(7)));
+    }
+
+    #[test]
+    fn rejected_edit_leaves_task_unchanged() {
+        let mut task = repeating("x");
+        let clear_due = TaskEdit {
+            name: Some("y".to_owned()),
+            due: Some(None),
+            ..TaskEdit::default()
+        };
+        assert!(matches!(
+            task.edit(clear_due),
+            Err(InvalidTaskError::RepeatWithoutDueDate)
+        ));
+        let blank_name = TaskEdit {
+            name: Some(" ".to_owned()),
+            due: Some(Some(at(12))),
+            ..TaskEdit::default()
+        };
+        assert!(matches!(
+            task.edit(blank_name),
+            Err(InvalidTaskError::EmptyName(_))
+        ));
+
+        assert_eq!(task.name, "x");
+        assert_eq!(task.due, Some(at(9)));
+    }
+
+    #[test]
+    fn task_edit_serialisation_distinguishes_unset_and_cleared() {
+        let edit = TaskEdit {
+            name: None,
+            due: Some(None),
+            repeat: Some(Some(Duration::days(1))),
+        };
+        let json = serde_json::to_string(&edit).unwrap();
+        assert!(!json.contains("name"), "unset fields are omitted: {json}");
+
+        let parsed: TaskEdit = serde_json::from_str(&json).unwrap();
+        assert!(parsed.name.is_none());
+        assert_eq!(parsed.due, Some(None));
+        assert_eq!(parsed.repeat, Some(Some(Duration::days(1))));
+    }
+
+    // Tree structure.
+
+    #[test]
+    fn sample_tree_has_expected_layout() {
+        let tree = sample_tree();
+        assert_eq!(
+            layout(&tree),
+            pairs(&[
+                ("31", "a"),
+                ("32", "b"),
+                ("370", "c"),
+                ("375", "d"),
+                ("9", "e")
+            ])
+        );
+        assert_compact(&tree, true);
+    }
+
+    #[test]
+    fn insert_into_empty_slot() {
+        let mut tree = TaskTree::new();
+        let inverse = insert(&mut tree, "4", "a", None);
+        assert!(matches!(inverse, Effect::Remove { id } if id.to_string() == "4"));
+        assert_eq!(layout(&tree), pairs(&[("4", "a")]));
+    }
+
+    #[test]
+    fn insert_with_displacement_moves_existing_task_down() {
+        let mut tree = TaskTree::new();
+        insert(&mut tree, "4", "a", None);
+        insert(&mut tree, "4b", "b", Some(2));
+        assert_eq!(layout(&tree), pairs(&[("42", "a"), ("4b", "b")]));
+    }
+
+    #[test]
+    fn insert_with_displacement_moves_existing_subtree_down() {
+        let mut tree = sample_tree();
+        insert(&mut tree, "3f", "f", Some(6));
+        assert_eq!(
+            layout(&tree),
+            pairs(&[
+                ("361", "a"),
+                ("362", "b"),
+                ("3670", "c"),
+                ("3675", "d"),
+                ("3f", "f"),
+                ("9", "e"),
+            ])
+        );
+        assert_compact(&tree, true);
+    }
+
+    #[test]
+    fn invalid_inserts_are_rejected_without_changes() {
+        let mut tree = sample_tree();
+        let before = snapshot(&tree);
+
+        for (at, displaced) in [
+            ("9", None),       // Occupied.
+            ("31", None),      // Occupied, inside a subtree.
+            ("91", None),      // Path runs through a task.
+            ("5", Some(1)),    // Nothing to displace at the root.
+            ("51", Some(2)),   // Nothing to displace.
+            ("91", Some(1)),   // Displaced digit collides with the new task.
+            ("", None),        // Empty id.
+            ("3", None),       // Occupied by a subtree.
+            ("9123", Some(1)), // Path runs through a task.
+        ] {
+            let result = tree.apply(Effect::Insert {
+                id: id_or_empty(at),
+                task: task("x"),
+                displaced: displaced.map(u4),
+            });
+            assert!(
+                matches!(result, Err(EffectError::InvalidPosition(_))),
+                "insert at {at:?} displacing {displaced:?} was accepted"
+            );
+        }
+
+        assert_eq!(snapshot(&tree), before);
+    }
+
+    fn id_or_empty(s: &str) -> TaskId {
+        if s.is_empty() { TaskId::new() } else { id(s) }
+    }
+
+    #[test]
+    fn remove_with_remaining_siblings_moves_nothing() {
+        let mut tree = sample_tree();
+        let inverse = tree.apply(Effect::Remove { id: id("31") }).unwrap();
+        assert!(matches!(
+            inverse,
+            Effect::Insert { ref id, ref task, displaced: None }
+                if id.to_string() == "31" && task.name == "a"
+        ));
+        assert_eq!(
+            layout(&tree),
+            pairs(&[("32", "b"), ("370", "c"), ("375", "d"), ("9", "e")])
+        );
+    }
+
+    #[test]
+    fn remove_leaving_one_task_moves_it_up() {
+        let mut tree = sample_tree();
+        let inverse = tree.apply(Effect::Remove { id: id("370") }).unwrap();
+        assert!(matches!(inverse, Effect::Insert { displaced: Some(d), .. } if d == u4(5)));
+        assert_eq!(
+            layout(&tree),
+            pairs(&[("31", "a"), ("32", "b"), ("37", "d"), ("9", "e")])
+        );
+        assert_compact(&tree, true);
+    }
+
+    #[test]
+    fn remove_leaving_one_subtree_moves_it_up() {
+        let mut tree = TaskTree::new();
+        insert(&mut tree, "3", "a", None);
+        insert(&mut tree, "37", "c", Some(1));
+        insert(&mut tree, "375", "d", Some(0));
+        assert_eq!(
+            layout(&tree),
+            pairs(&[("31", "a"), ("370", "c"), ("375", "d")])
+        );
+
+        let inverse = tree.apply(Effect::Remove { id: id("31") }).unwrap();
+        assert!(matches!(inverse, Effect::Insert { displaced: Some(d), .. } if d == u4(7)));
+        assert_eq!(layout(&tree), pairs(&[("30", "c"), ("35", "d")]));
+        assert_compact(&tree, true);
+    }
+
+    #[test]
+    fn remove_at_root_never_moves_anything() {
+        let mut tree = TaskTree::new();
+        insert(&mut tree, "1", "a", None);
+        insert(&mut tree, "2", "b", None);
+        let inverse = tree.apply(Effect::Remove { id: id("1") }).unwrap();
+        assert!(matches!(
+            inverse,
+            Effect::Insert {
+                displaced: None,
+                ..
+            }
+        ));
+        assert_eq!(layout(&tree), pairs(&[("2", "b")]));
+    }
+
+    #[test]
+    fn invalid_removes_are_rejected_without_changes() {
+        let mut tree = sample_tree();
+        let before = snapshot(&tree);
+
+        for at in ["5", "3", "37", "91", "310", "3f"] {
+            assert!(
+                matches!(
+                    tree.apply(Effect::Remove { id: id(at) }),
+                    Err(EffectError::Retrieval(RetrievalError::NoSuchId(_)))
+                ),
+                "remove at {at:?} was accepted"
+            );
+        }
+
+        assert_eq!(snapshot(&tree), before);
+    }
+
+    #[test]
+    fn get_task_requires_exact_leaf_path() {
+        let tree = sample_tree();
+        assert_eq!(tree.get_task(id("375").as_ref()).unwrap().name, "d");
+        assert!(tree.get_task(id("37").as_ref()).is_err());
+        assert!(tree.get_task(id("3755").as_ref()).is_err());
+        assert!(tree.get_task(&[]).is_err());
+    }
+
+    #[test]
+    fn optimise_collapses_legacy_chains() {
+        // `3: tree { 5: tree { 1: a, 2: b } }`, as older versions could produce.
+        let mut inner = TaskTree::new();
+        inner.children[1] = Some(TaskTreeNode::Task(task("a")));
+        inner.children[2] = Some(TaskTreeNode::Task(task("b")));
+        let mut middle = TaskTree::new();
+        middle.children[5] = Some(TaskTreeNode::Tree(Box::new(inner)));
+        let mut tree = TaskTree::new();
+        tree.children[3] = Some(TaskTreeNode::Tree(Box::new(middle)));
+        tree.children[4] = Some(TaskTreeNode::Tree(Box::default()));
+
+        tree.optimise();
+        assert_eq!(layout(&tree), pairs(&[("31", "a"), ("32", "b")]));
+        assert!(tree.children[4].is_none(), "empty subtrees are removed");
+        assert_compact(&tree, true);
+
+        let before = snapshot(&tree);
+        tree.optimise();
+        assert_eq!(snapshot(&tree), before, "optimise is idempotent");
+    }
+
+    // Effects.
+
+    #[test]
+    fn insert_and_remove_round_trip() {
+        let mut tree = sample_tree();
+        assert_round_trip(
+            &mut tree,
+            Effect::Insert {
+                id: id("3f"),
+                task: task("f"),
+                displaced: Some(u4(6)),
+            },
+        );
+        // The insert above moved the `3` subtree down to `36`.
+        assert_round_trip(&mut tree, Effect::Remove { id: id("3670") });
+        assert_round_trip(&mut tree, Effect::Remove { id: id("9") });
+    }
+
+    #[test]
+    fn status_effects_round_trip() {
+        let mut tree = sample_tree();
+        assert_round_trip(
+            &mut tree,
+            Effect::Start {
+                id: id("9"),
+                at: at(9),
+            },
+        );
+        assert_round_trip(
+            &mut tree,
+            Effect::Complete {
+                id: id("9"),
+                at: at(10),
+            },
+        );
+
+        tree.apply(Effect::Start {
+            id: id("31"),
+            at: at(9),
+        })
+        .unwrap();
+        assert_round_trip(&mut tree, Effect::Unstart { id: id("31") });
+        assert_round_trip(
+            &mut tree,
+            Effect::Complete {
+                id: id("31"),
+                at: at(10),
+            },
+        );
+
+        tree.apply(Effect::Complete {
+            id: id("32"),
+            at: at(10),
+        })
+        .unwrap();
+        assert_round_trip(&mut tree, Effect::Uncomplete { id: id("32") });
+    }
+
+    #[test]
+    fn edit_effect_round_trips() {
+        let mut tree = sample_tree();
+        assert_round_trip(
+            &mut tree,
+            Effect::Edit {
+                id: id("375"),
+                edit: TaskEdit {
+                    name: Some("renamed".to_owned()),
+                    due: Some(Some(at(12))),
+                    repeat: Some(Some(Duration::days(1))),
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn rejected_effects_leave_tree_unchanged() {
+        let mut tree = sample_tree();
+        tree.apply(Effect::Complete {
+            id: id("9"),
+            at: at(10),
+        })
+        .unwrap();
+        let before = snapshot(&tree);
+
+        let rejected = [
+            Effect::Start {
+                id: id("9"),
+                at: at(9),
+            },
+            Effect::Complete {
+                id: id("9"),
+                at: at(9),
+            },
+            Effect::Unstart { id: id("9") },
+            Effect::Uncomplete { id: id("31") },
+            Effect::Start {
+                id: id("5"),
+                at: at(9),
+            },
+            Effect::Edit {
+                id: id("31"),
+                edit: TaskEdit {
+                    repeat: Some(Some(Duration::days(1))),
+                    ..TaskEdit::default()
+                },
+            },
+        ];
+        for effect in rejected {
+            assert!(tree.apply(effect).is_err());
+        }
+
+        assert_eq!(snapshot(&tree), before);
+    }
+
+    // Commands.
+
+    #[test]
+    fn add_task_keeps_tree_compact() {
+        let mut tree = TaskTree::new();
+        let mut undo = Vec::new();
+        for i in 0..500 {
+            undo.push(tree.add_task(task(&format!("t{i}"))));
+        }
+
+        assert_compact(&tree, true);
+        assert_eq!(tree.collect_tasks(&TaskId::new()).len(), 500);
+
+        for record in undo.into_iter().rev() {
+            tree.apply_record(record).unwrap();
+            assert_compact(&tree, true);
+        }
+        assert_eq!(snapshot(&tree), snapshot(&TaskTree::new()));
+    }
+
+    #[test]
+    fn add_task_displacing_a_task_is_undone_exactly() {
+        let mut tree = TaskTree::new();
+        for i in 0..16 {
+            insert(&mut tree, &format!("{i:x}"), &format!("t{i}"), None);
+        }
+        let before = snapshot(&tree);
+
+        // Every root slot is taken, so the new task must displace one of them.
+        let record = tree.add_task(task("new"));
+        assert!(
+            tree.collect_tasks(&TaskId::new())
+                .iter()
+                .any(|(id, _)| id.as_ref().len() == 2)
+        );
+        assert_compact(&tree, true);
+
+        assert_record_round_trip(&mut tree, &before, record);
+    }
+
+    #[test]
+    fn delete_task_is_undone_exactly() {
+        let mut tree = sample_tree();
+        let before = snapshot(&tree);
+        let record = tree.delete_task(id("370").as_ref()).unwrap();
+        assert_record_round_trip(&mut tree, &before, record);
+
+        assert!(tree.delete_task(id("5").as_ref()).is_err());
+    }
+
+    #[test]
+    fn start_task_is_undone_exactly() {
+        let mut tree = sample_tree();
+        let before = snapshot(&tree);
+        let record = tree.start_task(id("9").as_ref()).unwrap();
+        assert!(matches!(
+            tree.get_task(id("9").as_ref()).unwrap().status,
+            TaskStatus::InProgress(_)
+        ));
+        assert_record_round_trip(&mut tree, &before, record);
+    }
+
+    #[test]
+    fn edit_and_postpone_tasks_are_undone_exactly() {
+        let mut tree = sample_tree();
+        tree.edit_task(
+            id("9").as_ref(),
+            TaskEdit {
+                due: Some(Some(at(9))),
+                ..TaskEdit::default()
+            },
+        )
+        .unwrap();
+
+        let before = snapshot(&tree);
+        let record = tree
+            .postpone_task(id("9").as_ref(), Duration::hours(1))
+            .unwrap();
+        assert_record_round_trip(&mut tree, &before, record);
+
+        let record = tree
+            .edit_task(
+                id("9").as_ref(),
+                TaskEdit {
+                    name: Some("renamed".to_owned()),
+                    ..TaskEdit::default()
+                },
+            )
+            .unwrap();
+        assert_record_round_trip(&mut tree, &before, record);
+
+        assert!(
+            tree.postpone_task(id("31").as_ref(), Duration::hours(1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn complete_task_without_repeat_only_changes_status() {
+        let mut tree = sample_tree();
+        let before = snapshot(&tree);
+        let record = tree.complete_task(id("9").as_ref()).unwrap();
+        assert_eq!(record.0.len(), 1);
+        assert_eq!(tree.collect_tasks(&TaskId::new()).len(), 5);
+        assert_record_round_trip(&mut tree, &before, record);
+    }
+
+    #[test]
+    fn complete_task_with_repeat_adds_next_occurrence() {
+        let mut tree = TaskTree::new();
+        tree.apply(Effect::Insert {
+            id: id("3"),
+            task: repeating("r"),
+            displaced: None,
+        })
+        .unwrap();
+        let before = snapshot(&tree);
+
+        let record = tree.complete_task(id("3").as_ref()).unwrap();
+        let tasks = tree.collect_tasks(&TaskId::new());
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|(_, task)| task.status == TaskStatus::Incomplete)
+                .count(),
+            1
+        );
+        assert_record_round_trip(&mut tree, &before, record);
+    }
+
+    #[test]
+    fn undoing_a_record_restores_ids_before_statuses() {
+        // Completing `3` spawns a task that displaces it to `37`. The record's effects refer
+        // to `3` as it was at each step, so undoing must remove the spawn first.
+        let mut tree = TaskTree::new();
+        tree.apply(Effect::Insert {
+            id: id("3"),
+            task: repeating("r"),
+            displaced: None,
+        })
+        .unwrap();
+        let before = snapshot(&tree);
+
+        let complete = tree
+            .apply(Effect::Complete {
+                id: id("3"),
+                at: at(10),
+            })
+            .unwrap();
+        let spawn = tree
+            .apply(Effect::Insert {
+                id: id("35"),
+                task: repeating("r"),
+                displaced: Some(u4(7)),
+            })
+            .unwrap();
+        assert!(matches!(
+            tree.get_task(id("37").as_ref()).unwrap().status,
+            TaskStatus::Complete(..)
+        ));
+
+        assert_record_round_trip(&mut tree, &before, Record(vec![complete, spawn]));
+    }
+
+    #[test]
+    fn complete_task_with_repeat_survives_displacing_itself() {
+        // With every root slot full, the spawned task displaces the completed one 1 in 16
+        // times. Enough rounds make it near certain that case is covered.
+        let mut displaced_itself = false;
+        for _ in 0..300 {
+            let mut tree = TaskTree::new();
+            for i in 0..16 {
+                let task = if i == 3 { repeating("r") } else { task("x") };
+                tree.apply(Effect::Insert {
+                    id: id(&format!("{i:x}")),
+                    task,
+                    displaced: None,
+                })
+                .unwrap();
+            }
+            let before = snapshot(&tree);
+
+            let record = tree.complete_task(id("3").as_ref()).unwrap();
+            displaced_itself |= tree.get_task(id("3").as_ref()).is_err();
+            assert_compact(&tree, true);
+            assert_record_round_trip(&mut tree, &before, record);
+        }
+        assert!(displaced_itself);
+    }
+
+    #[test]
+    fn failed_command_leaves_tree_unchanged() {
+        let mut tree = sample_tree();
+        tree.complete_task(id("9").as_ref()).unwrap();
+        let before = snapshot(&tree);
+
+        assert!(tree.complete_task(id("9").as_ref()).is_err());
+        assert!(tree.start_task(id("9").as_ref()).is_err());
+        assert!(tree.complete_task(id("5").as_ref()).is_err());
+        assert_eq!(snapshot(&tree), before);
+    }
+
+    #[test]
+    fn records_survive_serialisation() {
+        let mut tree = sample_tree();
+        let before = snapshot(&tree);
+        let record = tree.delete_task(id("370").as_ref()).unwrap();
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""displaced":5"#), "{json}");
+        let record: Record = serde_json::from_str(&json).unwrap();
+
+        let redo = tree.apply_record(record).unwrap();
+        assert_eq!(snapshot(&tree), before);
+
+        let json = serde_json::to_string(&redo).unwrap();
+        assert_eq!(json, r#"[{"Remove":{"id":"370"}}]"#);
+    }
+
+    #[test]
+    fn random_command_history_undoes_and_redoes_exactly() {
+        let mut tree = TaskTree::new();
+        let mut snapshots = vec![snapshot(&tree)];
+        let mut undo = Vec::new();
+
+        for i in 0..400 {
+            let ids: Vec<TaskId> = tree
+                .collect_tasks(&TaskId::new())
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let target = (!ids.is_empty()).then(|| ids[random_range(0..ids.len())].clone());
+            let name = format!("t{i}");
+
+            let record = match (random_range(0..8), target) {
+                (0..3, _) | (_, None) => Ok(tree.add_task(task(&name))),
+                (3, _) => Ok(tree.add_task(repeating(&name))),
+                (4, Some(id)) => tree.complete_task(id.as_ref()),
+                (5, Some(id)) => tree.start_task(id.as_ref()),
+                (6, Some(id)) => tree.delete_task(id.as_ref()),
+                (_, Some(id)) => tree.edit_task(
+                    id.as_ref(),
+                    TaskEdit {
+                        name: Some(name),
+                        ..TaskEdit::default()
+                    },
+                ),
+            };
+            // Starting or completing a task twice is expected to fail.
+            let Ok(record) = record else { continue };
+
+            assert_compact(&tree, true);
+            undo.push(record);
+            snapshots.push(snapshot(&tree));
+        }
+
+        let mut redo = Vec::new();
+        while let Some(record) = undo.pop() {
+            redo.push(tree.apply_record(record).unwrap());
+            assert_eq!(snapshot(&tree), snapshots[undo.len()]);
+        }
+        while let Some(record) = redo.pop() {
+            undo.push(tree.apply_record(record).unwrap());
+            assert_eq!(snapshot(&tree), snapshots[undo.len()]);
+        }
+    }
+
+    // Display.
+
+    #[test]
+    fn list_is_sorted_filtered_and_aligned() {
+        let mut tree = TaskTree::new();
+        tree.apply(Effect::Insert {
+            id: id("1"),
+            task: Task::new("later".to_owned(), Some(at(12)), None).unwrap(),
+            displaced: None,
+        })
+        .unwrap();
+        tree.apply(Effect::Insert {
+            id: id("2"),
+            task: Task::new("sooner".to_owned(), Some(at(9)), None).unwrap(),
+            displaced: None,
+        })
+        .unwrap();
+        insert(&mut tree, "3", "whenever", None);
+        insert(&mut tree, "4", "done", None);
+        insert(&mut tree, "45", "busy", Some(0));
+        tree.start_task(id("45").as_ref()).unwrap();
+        tree.complete_task(id("40").as_ref()).unwrap();
+
+        let filter = TaskFilter {
+            status: Some(StatusFilter::Not(StatusKind::Complete)),
+            due_before: None,
+        };
+        let output = tree.filtered(&filter).to_string();
+        let names: Vec<&str> = output
+            .lines()
+            .map(|line| line.split_whitespace().find(|word| word.len() > 2).unwrap())
+            .collect();
+        assert_eq!(names, ["busy", "sooner", "later", "whenever"]);
+        assert!(
+            output
+                .lines()
+                .all(|line| line.starts_with(|c: char| c.is_ascii_hexdigit()))
+        );
+        assert!(output.lines().next().unwrap().starts_with("45   -  busy"));
+        assert!(!output.contains("done"));
+        assert!(
+            tree.to_string().contains("done"),
+            "unfiltered display shows everything"
+        );
     }
 }

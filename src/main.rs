@@ -13,34 +13,59 @@ use task_tracke_rs::{
     parse_due_in, parse_name, parse_time_delta,
 };
 
+/// A command-line task tracker with undo and redo.
 #[derive(Parser)]
+#[command(name = "todo", version, after_help = FORMATS)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
+const FORMATS: &str = "\
+Value formats:
+  <ID>        A task's id, as shown by `todo show`, in hexadecimal, e.g. 3 or a7
+  <NAME>      Any non-blank text. Quote names containing spaces, e.g. \"write report\"
+  <DURATION>  Numbers with units, e.g. 30m, 2h, 3d, 1w2d or 1month. Quote any with spaces
+              Units: s, m (minutes), h, d, w, month or M, y
+  <DATE>      Local time as 'YYYY-MM-DD HH:MM', or 'YYYY-MM-DD' for midnight
+  <STATUS>    incomplete, in-progress or complete, with a leading ! to negate, e.g. '!complete'";
+
 #[derive(Subcommand)]
 enum Commands {
-    List(ListArgs),
+    /// Show tasks, or one task in detail. This is the default command.
+    Show(ShowArgs),
+    /// Add a task.
     Add(AddArgs),
+    /// Change a task's name, due date or repeat.
     Edit(EditArgs),
+    /// Mark a task as in progress.
     Start(StartArgs),
+    /// Mark a task as complete. Repeating tasks are added again with their next due date.
     Complete(CompleteArgs),
+    /// Delete a task.
     Delete(DeleteArgs),
+    /// Push a task's due date back.
     Postpone(PostponeArgs),
+    /// Undo the last command that changed tasks.
     Undo,
+    /// Redo the last undone command.
     Redo,
+    /// Permanently delete all tasks and undo history.
     Purge(PurgeArgs),
 }
 
 #[derive(Args, Default)]
-struct ListArgs {
-    #[arg(conflicts_with_all = ["status", "all", "overdue", "due_within"])]
+struct ShowArgs {
+    /// Show this task in detail, e.g. 3a.
+    #[arg(
+        value_name = "ID",
+        conflicts_with_all = ["status", "all", "overdue", "due_within"]
+    )]
     id: Option<TaskId>,
 
     /// Filter by status: incomplete, in-progress or complete, negated with a leading '!'.
-    /// Defaults to !complete.
-    #[arg(long, conflicts_with = "all")]
+    /// Defaults to '!complete'. Quote negations, as '!' is special in many shells.
+    #[arg(long, value_name = "STATUS", conflicts_with = "all")]
     status: Option<StatusFilter>,
 
     /// Show tasks of every status.
@@ -51,12 +76,12 @@ struct ListArgs {
     #[arg(long, conflicts_with = "due_within")]
     overdue: bool,
 
-    /// Only show tasks due within the given duration, including overdue tasks.
-    #[arg(long, value_parser = parse_due_in)]
+    /// Only show tasks due within the given duration, including overdue tasks, e.g. 3d.
+    #[arg(long, value_name = "DURATION", value_parser = parse_due_in)]
     due_within: Option<DateTime<Local>>,
 }
 
-impl ListArgs {
+impl ShowArgs {
     fn filter(&self) -> TaskFilter {
         let status = if self.all {
             None
@@ -80,19 +105,25 @@ impl ListArgs {
 #[derive(Args)]
 #[command(group(ArgGroup::new("due_date").args(["due", "due_at"])))]
 struct AddArgs {
-    #[arg(value_parser = parse_name)]
+    /// The task's name. Quote names containing spaces, e.g. "write report".
+    #[arg(value_name = "NAME", value_parser = parse_name)]
     name: String,
 
-    /// Due in the given duration from now.
-    #[arg(long, value_parser = parse_due_in)]
+    /// Due the given duration from now, e.g. 2h, 3d or 1w2d.
+    #[arg(long, value_name = "DURATION", value_parser = parse_due_in)]
     due: Option<DateTime<Local>>,
 
-    /// Due at the given local time: 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD' (midnight).
-    #[arg(long, value_parser = parse_due_at)]
+    /// Due at the given local time, as 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD' for midnight.
+    #[arg(long, value_name = "DATE", value_parser = parse_due_at)]
     due_at: Option<DateTime<Local>>,
 
-    /// Repeat by the given duration on completion. Requires a due date.
-    #[arg(long, requires = "due_date", value_parser = parse_time_delta)]
+    /// When completed, add the task again due this much later, e.g. 1d or 1w. Requires a due date.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        requires = "due_date",
+        value_parser = parse_time_delta
+    )]
     repeat: Option<Duration>,
 }
 
@@ -106,25 +137,29 @@ struct AddArgs {
 #[command(group(ArgGroup::new("due_change").args(["due", "due_at", "no_due"])))]
 #[command(group(ArgGroup::new("repeat_change").args(["repeat", "no_repeat"])))]
 struct EditArgs {
+    /// The task to edit, e.g. 3a.
+    #[arg(value_name = "ID")]
     id: TaskId,
 
-    #[arg(long, value_parser = parse_name)]
+    /// Rename the task. Quote names containing spaces, e.g. "write report".
+    #[arg(long, value_name = "NAME", value_parser = parse_name)]
     name: Option<String>,
 
-    /// Set the due date to the given duration from now.
-    #[arg(long, value_parser = parse_due_in)]
+    /// Set the due date to the given duration from now, e.g. 2h, 3d or 1w2d.
+    #[arg(long, value_name = "DURATION", value_parser = parse_due_in)]
     due: Option<DateTime<Local>>,
 
-    /// Set the due date to the given local time: 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD' (midnight).
-    #[arg(long, value_parser = parse_due_at)]
+    /// Set the due date to the given local time, as 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD' for
+    /// midnight.
+    #[arg(long, value_name = "DATE", value_parser = parse_due_at)]
     due_at: Option<DateTime<Local>>,
 
     /// Remove the due date.
     #[arg(long)]
     no_due: bool,
 
-    /// Set the repeat duration.
-    #[arg(long, value_parser = parse_time_delta)]
+    /// Set how much later the task is due again once completed, e.g. 1d or 1w.
+    #[arg(long, value_name = "DURATION", value_parser = parse_time_delta)]
     repeat: Option<Duration>,
 
     /// Remove the repeat.
@@ -156,23 +191,32 @@ impl EditArgs {
 
 #[derive(Args)]
 struct StartArgs {
+    /// The task to start, e.g. 3a.
+    #[arg(value_name = "ID")]
     id: TaskId,
 }
 
 #[derive(Args)]
 struct CompleteArgs {
+    /// The task to complete, e.g. 3a.
+    #[arg(value_name = "ID")]
     id: TaskId,
 }
 
 #[derive(Args)]
 struct DeleteArgs {
+    /// The task to delete, e.g. 3a.
+    #[arg(value_name = "ID")]
     id: TaskId,
 }
 
 #[derive(Args)]
 struct PostponeArgs {
+    /// The task to postpone, e.g. 3a.
+    #[arg(value_name = "ID")]
     id: TaskId,
-    #[arg(value_parser = parse_time_delta)]
+    /// How long to postpone by, e.g. 2h or 1w2d. Overdue tasks are postponed from now.
+    #[arg(value_name = "DURATION", value_parser = parse_time_delta)]
     duration: Duration,
 }
 
@@ -451,7 +495,7 @@ fn main() -> Result<()> {
             .join("task-tracke-rs"),
     );
 
-    let command = cli.command.unwrap_or(Commands::List(ListArgs::default()));
+    let command = cli.command.unwrap_or(Commands::Show(ShowArgs::default()));
 
     if let Commands::Purge(args) = &command {
         ensure!(
@@ -467,9 +511,9 @@ fn main() -> Result<()> {
     let mut state = store.load()?;
 
     let record = match &command {
-        Commands::List(args) => {
+        Commands::Show(args) => {
             match &args.id {
-                Some(id) => print!("{}", state.tree.get_task(id.as_ref())?),
+                Some(id) => println!("{}", state.tree.get_task(id.as_ref())?),
                 None => print!("{}", state.tree.filtered(&args.filter())),
             }
             return Ok(());
@@ -501,7 +545,475 @@ fn main() -> Result<()> {
         store.commit(&mut state, record)?;
     }
 
-    print!("{}", state.tree.filtered(&ListArgs::default().filter()));
+    print!("{}", state.tree.filtered(&ShowArgs::default().filter()));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use task_tracke_rs::Task;
+    use tempfile::TempDir;
+
+    fn record(name: &str) -> Record {
+        TaskTree::new().add_task(Task::new(name.to_owned(), None, None).unwrap())
+    }
+
+    fn entry(seq: u64) -> Entry {
+        Entry {
+            seq,
+            record: record("x"),
+        }
+    }
+
+    fn stack(dir: &TempDir) -> Stack {
+        Stack(dir.path().join("stack.jsonl"))
+    }
+
+    fn store(dir: &TempDir) -> Store {
+        Store::new(dir.path().join("task-tracke-rs"))
+    }
+
+    fn tree_json(state: &State) -> String {
+        serde_json::to_string(&state.tree).unwrap()
+    }
+
+    /// Runs `count` new commands, each adding a task.
+    fn add_tasks(store: &Store, state: &mut State, count: usize) {
+        for i in 0..count {
+            let record = state
+                .tree
+                .add_task(Task::new(format!("t{i}"), None, None).unwrap());
+            store.commit(state, record).unwrap();
+        }
+    }
+
+    fn seqs(stack: &Stack) -> Vec<u64> {
+        std::fs::read_to_string(&stack.0)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Entry>(line).unwrap().seq)
+            .collect()
+    }
+
+    // Stack.
+
+    #[test]
+    fn missing_stack_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let stack = stack(&dir);
+        assert!(stack.peek().unwrap().is_none());
+        stack.pop().unwrap();
+        stack.clear().unwrap();
+    }
+
+    #[test]
+    fn stack_pushes_and_pops_in_order() {
+        let dir = TempDir::new().unwrap();
+        let stack = stack(&dir);
+        for seq in 0..3 {
+            stack.push(&entry(seq)).unwrap();
+        }
+
+        for seq in (0..3).rev() {
+            assert_eq!(stack.peek_seq().unwrap(), Some(seq));
+            stack.pop().unwrap();
+        }
+        assert!(stack.peek().unwrap().is_none());
+        assert_eq!(std::fs::metadata(&stack.0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stack_handles_lines_longer_than_a_chunk() {
+        let dir = TempDir::new().unwrap();
+        let stack = stack(&dir);
+        let long = Entry {
+            seq: 1,
+            record: record(&"x".repeat(10_000)),
+        };
+        stack.push(&entry(0)).unwrap();
+        stack.push(&long).unwrap();
+        stack.push(&long).unwrap();
+
+        stack.pop().unwrap();
+        assert_eq!(stack.peek_seq().unwrap(), Some(1));
+        stack.pop().unwrap();
+        assert_eq!(stack.peek_seq().unwrap(), Some(0));
+        stack.pop().unwrap();
+        assert!(stack.peek().unwrap().is_none());
+    }
+
+    #[test]
+    fn stack_discards_partial_last_line() {
+        let dir = TempDir::new().unwrap();
+        let stack = stack(&dir);
+        stack.push(&entry(0)).unwrap();
+        stack.push(&entry(1)).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&stack.0)
+            .unwrap()
+            .write_all(br#"{"seq":2,"rec"#)
+            .unwrap();
+
+        assert_eq!(stack.peek_seq().unwrap(), Some(1));
+        assert_eq!(seqs(&stack), [0, 1]);
+    }
+
+    #[test]
+    fn stack_discards_partial_only_line() {
+        let dir = TempDir::new().unwrap();
+        let stack = stack(&dir);
+        std::fs::write(&stack.0, r#"{"seq":0"#).unwrap();
+        assert!(stack.peek().unwrap().is_none());
+        assert_eq!(std::fs::metadata(&stack.0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn corrupt_stack_line_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let stack = stack(&dir);
+        std::fs::write(&stack.0, "not json\n").unwrap();
+        assert!(stack.peek().is_err());
+    }
+
+    #[test]
+    fn line_start_finds_line_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("lines");
+        let text = format!("a\n{}\nb\n", "x".repeat(5000));
+        std::fs::write(&path, &text).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let len = u64::try_from(text.len()).unwrap();
+
+        assert_eq!(line_start(&mut file, len).unwrap(), len);
+        assert_eq!(line_start(&mut file, len - 1).unwrap(), len - 2);
+        assert_eq!(line_start(&mut file, len - 2).unwrap(), len - 2);
+        // Searches back across a chunk boundary to the newline after `a`.
+        assert_eq!(line_start(&mut file, len - 3).unwrap(), 2);
+        assert_eq!(line_start(&mut file, 1).unwrap(), 0);
+        assert_eq!(line_start(&mut file, 0).unwrap(), 0);
+    }
+
+    // Store.
+
+    #[test]
+    fn load_without_saved_state_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let state = store(&dir).load().unwrap();
+        assert_eq!(state.undo_len, 0);
+        assert_eq!(
+            tree_json(&state),
+            serde_json::to_string(&TaskTree::new()).unwrap()
+        );
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        add_tasks(&store, &mut state, 3);
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.undo_len, 3);
+        assert_eq!(tree_json(&loaded), tree_json(&state));
+        assert!(!store.tasks.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn load_migrates_legacy_tree() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        std::fs::create_dir_all(&store.dir).unwrap();
+
+        // `3: tree { 5: tree { 1: a, 2: b } }`, a chain older versions could produce.
+        let task = |name: &str| {
+            serde_json::json!({ "Task": {
+                "creation_date": "2030-01-01T00:00:00Z",
+                "due": null,
+                "name": name,
+                "status": "Incomplete",
+                "repeat": null,
+            }})
+        };
+        let tree = |children: Vec<(usize, serde_json::Value)>| {
+            let mut slots = vec![serde_json::Value::Null; 16];
+            for (i, child) in children {
+                slots[i] = child;
+            }
+            serde_json::json!({ "children": slots })
+        };
+        let inner = tree(vec![(1, task("a")), (2, task("b"))]);
+        let middle = tree(vec![(5, serde_json::json!({ "Tree": inner }))]);
+        let root = tree(vec![(3, serde_json::json!({ "Tree": middle }))]);
+        std::fs::write(&store.tasks, root.to_string()).unwrap();
+
+        let state = store.load().unwrap();
+        assert_eq!(state.undo_len, 0);
+        let ids: Vec<String> = state
+            .tree
+            .collect_tasks(&TaskId::new())
+            .into_iter()
+            .map(|(id, _)| id.to_string())
+            .collect();
+        assert_eq!(ids, ["31", "32"]);
+    }
+
+    #[test]
+    fn corrupt_state_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        std::fs::create_dir_all(&store.dir).unwrap();
+        std::fs::write(&store.tasks, r#"{"undo_len": "x"}"#).unwrap();
+        assert!(store.load().is_err());
+    }
+
+    #[test]
+    fn commit_undo_and_redo_keep_stacks_in_step() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        let mut snapshots = vec![tree_json(&state)];
+        for i in 1..=3 {
+            add_tasks(&store, &mut state, 1);
+            snapshots.push(tree_json(&state));
+            assert_eq!(state.undo_len, i);
+        }
+        assert_eq!(seqs(&store.undo), [0, 1, 2]);
+
+        for len in (0..3).rev() {
+            store.undo(&mut state).unwrap();
+            assert_eq!(state.undo_len, len);
+            assert_eq!(tree_json(&state), snapshots[usize::try_from(len).unwrap()]);
+        }
+        assert!(store.undo(&mut state).is_err());
+        assert_eq!(seqs(&store.undo), [] as [u64; 0]);
+        assert_eq!(seqs(&store.redo), [2, 1, 0]);
+
+        for len in 1..=3 {
+            store.redo(&mut state).unwrap();
+            assert_eq!(state.undo_len, len);
+            assert_eq!(tree_json(&state), snapshots[usize::try_from(len).unwrap()]);
+        }
+        assert!(store.redo(&mut state).is_err());
+        assert_eq!(seqs(&store.undo), [0, 1, 2]);
+
+        let saved = store.load().unwrap();
+        assert_eq!(saved.undo_len, 3);
+        assert_eq!(tree_json(&saved), snapshots[3]);
+    }
+
+    #[test]
+    fn nothing_to_undo_or_redo_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        assert!(store.undo(&mut state).is_err());
+        assert!(store.redo(&mut state).is_err());
+        assert!(!store.tasks.exists());
+    }
+
+    #[test]
+    fn new_command_clears_redo() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        add_tasks(&store, &mut state, 2);
+        store.undo(&mut state).unwrap();
+        assert_eq!(seqs(&store.redo), [1]);
+
+        add_tasks(&store, &mut state, 1);
+        assert!(!store.redo.0.exists());
+        assert_eq!(seqs(&store.undo), [0, 1]);
+        assert!(store.redo(&mut state).is_err());
+    }
+
+    #[test]
+    fn reconcile_drops_push_from_interrupted_command() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        add_tasks(&store, &mut state, 2);
+        let committed = tree_json(&state);
+
+        // The command pushed its record, but never saved the state.
+        store.undo.push(&entry(2)).unwrap();
+
+        let mut state = store.load().unwrap();
+        store.undo(&mut state).unwrap();
+        assert_eq!(state.undo_len, 1);
+        store.redo(&mut state).unwrap();
+        assert_eq!(tree_json(&state), committed);
+    }
+
+    #[test]
+    fn reconcile_drops_push_from_interrupted_undo() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        add_tasks(&store, &mut state, 2);
+        store.undo(&mut state).unwrap();
+
+        // An undo of record 0 pushed its inverse, but never saved the state.
+        store.redo.push(&entry(0)).unwrap();
+
+        let mut state = store.load().unwrap();
+        store.redo(&mut state).unwrap();
+        assert_eq!(state.undo_len, 2);
+        assert!(store.redo(&mut state).is_err());
+    }
+
+    #[test]
+    fn reconcile_drops_unpopped_entry_after_undo_or_redo() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        add_tasks(&store, &mut state, 2);
+
+        // An undo saved the state, but never popped the undo stack.
+        store.undo(&mut state).unwrap();
+        store.undo.push(&entry(1)).unwrap();
+        let mut state = store.load().unwrap();
+        store.undo(&mut state).unwrap();
+        assert_eq!(state.undo_len, 0);
+
+        // A redo saved the state, but never popped the redo stack.
+        store.redo(&mut state).unwrap();
+        store.redo.push(&entry(0)).unwrap();
+        let mut state = store.load().unwrap();
+        store.redo(&mut state).unwrap();
+        assert_eq!(state.undo_len, 2);
+        assert!(store.redo(&mut state).is_err());
+    }
+
+    #[test]
+    fn mismatched_history_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        add_tasks(&store, &mut state, 2);
+        store.undo.push(&entry(7)).unwrap();
+
+        let mut state = store.load().unwrap();
+        let before = tree_json(&state);
+        assert!(store.undo(&mut state).is_err());
+        let record = state
+            .tree
+            .add_task(Task::new("x".to_owned(), None, None).unwrap());
+        assert!(store.commit(&mut state, record).is_err());
+        assert_eq!(tree_json(&store.load().unwrap()), before);
+    }
+
+    #[test]
+    fn missing_undo_history_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        add_tasks(&store, &mut state, 2);
+        std::fs::remove_file(&store.undo.0).unwrap();
+
+        let mut state = store.load().unwrap();
+        assert!(store.undo(&mut state).is_err());
+    }
+
+    #[test]
+    fn purge_deletes_everything() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let mut state = State::default();
+        add_tasks(&store, &mut state, 2);
+        store.undo(&mut state).unwrap();
+
+        store.purge().unwrap();
+        assert!(!store.tasks.exists());
+        assert!(!store.undo.0.exists());
+        assert!(!store.redo.0.exists());
+
+        let mut state = store.load().unwrap();
+        assert_eq!(state.undo_len, 0);
+        assert!(store.undo(&mut state).is_err());
+        assert!(store.redo(&mut state).is_err());
+        store.purge().unwrap();
+    }
+
+    // Command line.
+
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        assert_eq!(Cli::command().get_name(), "todo");
+    }
+
+    #[test]
+    fn purge_requires_unsafe_flag() {
+        let Some(Commands::Purge(args)) = Cli::try_parse_from(["todo", "purge"]).unwrap().command
+        else {
+            panic!("expected purge");
+        };
+        assert!(!args.confirmed);
+
+        let Some(Commands::Purge(args)) = Cli::try_parse_from(["todo", "purge", "--unsafe"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected purge");
+        };
+        assert!(args.confirmed);
+    }
+
+    #[test]
+    fn edit_requires_a_change_and_rejects_conflicts() {
+        assert!(Cli::try_parse_from(["todo", "edit", "3"]).is_err());
+        assert!(Cli::try_parse_from(["todo", "edit", "3", "--due", "1d", "--no-due"]).is_err());
+        assert!(
+            Cli::try_parse_from(["todo", "edit", "3", "--repeat", "1d", "--no-repeat"]).is_err()
+        );
+
+        let Some(Commands::Edit(args)) =
+            Cli::try_parse_from(["todo", "edit", "3", "--no-due", "--no-repeat"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected edit");
+        };
+        let edit = args.edit();
+        assert_eq!(edit.due, Some(None));
+        assert_eq!(edit.repeat, Some(None));
+        assert!(edit.name.is_none());
+    }
+
+    #[test]
+    fn add_repeat_requires_due_date() {
+        assert!(Cli::try_parse_from(["todo", "add", "x", "--repeat", "1d"]).is_err());
+        assert!(Cli::try_parse_from(["todo", "add", "x", "--due", "1d", "--repeat", "1d"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["todo", "add", "x", "--due", "1d", "--due-at", "2030-01-01"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["todo", "add", " "]).is_err());
+    }
+
+    #[test]
+    fn show_filter_defaults_to_hiding_completed() {
+        let filter = ShowArgs::default().filter();
+        assert!(matches!(
+            filter.status,
+            Some(StatusFilter::Not(StatusKind::Complete))
+        ));
+        assert!(filter.due_before.is_none());
+
+        let Some(Commands::Show(args)) =
+            Cli::try_parse_from(["todo", "show", "--all", "--overdue"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected show");
+        };
+        let filter = args.filter();
+        assert!(filter.status.is_none());
+        assert!(filter.due_before.is_some());
+    }
 }
