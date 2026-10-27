@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::max,
     fmt::{self, Write},
+    str::FromStr,
     string::String,
 };
 use thiserror::Error;
@@ -38,6 +39,30 @@ pub enum TaskStatus {
     Complete(Option<DateTime<Local>>, DateTime<Local>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    Incomplete,
+    InProgress,
+    Complete,
+}
+
+#[derive(Clone, Copy)]
+pub enum StatusFilter {
+    Is(StatusKind),
+    Not(StatusKind),
+}
+
+#[derive(Default)]
+pub struct TaskFilter {
+    pub status: Option<StatusFilter>,
+    pub due_before: Option<DateTime<Local>>,
+}
+
+pub struct FilteredTaskTree<'a> {
+    tree: &'a TaskTree,
+    filter: &'a TaskFilter,
+}
+
 #[derive(Debug, Error)]
 pub enum StatusError {
     #[error("Task already started.")]
@@ -55,6 +80,12 @@ pub enum RetrievalError {
     #[error("Invalid hex string.")]
     InvalidHexString,
 }
+
+#[derive(Debug, Error)]
+#[error(
+    "Invalid status filter '{0}'. Expected incomplete, in-progress or complete, optionally prefixed with '!'."
+)]
+pub struct ParseStatusFilterError(String);
 
 impl TaskTree {
     #[must_use]
@@ -215,13 +246,17 @@ impl TaskTree {
         f: &mut fmt::Formatter<'_>,
         prefix: &TaskId,
         id_width: usize,
+        filter: &TaskFilter,
     ) -> fmt::Result {
         let mut tasks = self.collect_tasks(prefix);
+        tasks.retain(|(_, task)| filter.matches(task));
 
         tasks.sort_by(|a, b| {
             a.1.status
                 .cmp(&b.1.status)
-                .then_with(|| b.1.due.cmp(&a.1.due))
+                // Soonest due first, tasks without a due date last.
+                .then_with(|| a.1.due.is_none().cmp(&b.1.due.is_none()))
+                .then_with(|| a.1.due.cmp(&b.1.due))
         });
 
         let name_width = tasks
@@ -264,6 +299,11 @@ impl TaskTree {
         }
 
         Ok(())
+    }
+
+    #[must_use]
+    pub fn filtered<'a>(&'a self, filter: &'a TaskFilter) -> FilteredTaskTree<'a> {
+        FilteredTaskTree { tree: self, filter }
     }
 
     #[must_use]
@@ -404,6 +444,64 @@ impl Task {
     }
 }
 
+impl TaskStatus {
+    #[must_use]
+    pub fn kind(&self) -> StatusKind {
+        match self {
+            TaskStatus::Incomplete => StatusKind::Incomplete,
+            TaskStatus::InProgress(_) => StatusKind::InProgress,
+            TaskStatus::Complete(_, _) => StatusKind::Complete,
+        }
+    }
+}
+
+impl StatusFilter {
+    #[must_use]
+    pub fn matches(self, kind: StatusKind) -> bool {
+        match self {
+            StatusFilter::Is(expected) => kind == expected,
+            StatusFilter::Not(excluded) => kind != excluded,
+        }
+    }
+}
+
+impl FromStr for StatusFilter {
+    type Err = ParseStatusFilterError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (negated, kind) = match s.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+
+        let kind = match kind {
+            "incomplete" => StatusKind::Incomplete,
+            "in-progress" => StatusKind::InProgress,
+            "complete" => StatusKind::Complete,
+            _ => return Err(ParseStatusFilterError(s.to_owned())),
+        };
+
+        Ok(if negated {
+            StatusFilter::Not(kind)
+        } else {
+            StatusFilter::Is(kind)
+        })
+    }
+}
+
+impl TaskFilter {
+    /// Returns whether the task passes every filter that is set.
+    /// Tasks without a due date never pass a `due_before` filter.
+    #[must_use]
+    pub fn matches(&self, task: &Task) -> bool {
+        self.status
+            .is_none_or(|status| status.matches(task.status.kind()))
+            && self
+                .due_before
+                .is_none_or(|before| task.due.is_some_and(|due| due <= before))
+    }
+}
+
 impl TaskId {
     pub fn push(&mut self, digit: U4) {
         self.0.push(digit);
@@ -441,8 +539,15 @@ impl From<std::num::TryFromIntError> for RetrievalError {
 
 impl fmt::Display for TaskTree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let id_width = self.max_id_len().next_multiple_of(4);
-        self.fmt_helper(f, &TaskId::new(), id_width)
+        self.filtered(&TaskFilter::default()).fmt(f)
+    }
+}
+
+impl fmt::Display for FilteredTaskTree<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id_width = self.tree.max_id_len().next_multiple_of(4);
+        self.tree
+            .fmt_helper(f, &TaskId::new(), id_width, self.filter)
     }
 }
 

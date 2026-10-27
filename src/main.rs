@@ -8,7 +8,7 @@ use std::{
     io::{BufReader, BufWriter},
     path::Path,
 };
-use task_tracke_rs::{RetrievalError, Task, TaskTree};
+use task_tracke_rs::{RetrievalError, StatusFilter, StatusKind, Task, TaskFilter, TaskTree};
 use u4::U4 as u4;
 
 #[derive(Parser)]
@@ -28,9 +28,48 @@ enum Commands {
     Purge,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 struct ListArgs {
+    #[arg(conflicts_with_all = ["status", "all", "overdue", "due_within"])]
     id: Option<String>,
+
+    /// Filter by status: incomplete, in-progress or complete, negated with a leading '!'.
+    /// Defaults to !complete.
+    #[arg(long, conflicts_with = "all")]
+    status: Option<StatusFilter>,
+
+    /// Show tasks of every status.
+    #[arg(long)]
+    all: bool,
+
+    /// Only show tasks whose due date has passed.
+    #[arg(long, conflicts_with = "due_within")]
+    overdue: bool,
+
+    /// Only show tasks due within the given duration, including overdue tasks.
+    #[arg(long)]
+    due_within: Option<Duration>,
+}
+
+impl ListArgs {
+    fn filter(&self) -> TaskFilter {
+        let status = if self.all {
+            None
+        } else {
+            Some(
+                self.status
+                    .unwrap_or(StatusFilter::Not(StatusKind::Complete)),
+            )
+        };
+
+        let due_before = if self.overdue {
+            Some(Local::now())
+        } else {
+            parse_due(self.due_within)
+        };
+
+        TaskFilter { status, due_before }
+    }
 }
 
 #[derive(Args)]
@@ -138,10 +177,12 @@ fn main() -> Result<()> {
             .join("task-tracke-rs/tasks.json"),
     )?;
 
-    match &cli.command.unwrap_or(Commands::List(ListArgs { id: None })) {
+    let default_filter = ListArgs::default().filter();
+
+    match &cli.command.unwrap_or(Commands::List(ListArgs::default())) {
         Commands::List(args) => match &args.id {
             Some(id) => print!("{}", task_tree.get_task(&parse_hex_string(id)?)?),
-            None => print!("{task_tree}"),
+            None => print!("{}", task_tree.filtered(&args.filter())),
         },
         Commands::Add(args) => {
             task_tree.add_task(Task::new(
@@ -155,7 +196,7 @@ fn main() -> Result<()> {
                     .unwrap()
                     .join("task-tracke-rs/tasks.json"),
             )?;
-            print!("{task_tree}");
+            print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Start(args) => {
             task_tree
@@ -167,7 +208,7 @@ fn main() -> Result<()> {
                     .unwrap()
                     .join("task-tracke-rs/tasks.json"),
             )?;
-            print!("{task_tree}");
+            print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Complete(args) => {
             if let Some(next) = task_tree
@@ -182,7 +223,7 @@ fn main() -> Result<()> {
                     .unwrap()
                     .join("task-tracke-rs/tasks.json"),
             )?;
-            print!("{task_tree}");
+            print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Delete(args) => {
             task_tree.delete_task(&parse_hex_string(&args.id)?)?;
@@ -192,7 +233,7 @@ fn main() -> Result<()> {
                     .unwrap()
                     .join("task-tracke-rs/tasks.json"),
             )?;
-            print!("{task_tree}");
+            print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Postpone(args) => {
             task_tree
@@ -204,7 +245,7 @@ fn main() -> Result<()> {
                     .unwrap()
                     .join("task-tracke-rs/tasks.json"),
             )?;
-            print!("{task_tree}");
+            print!("{}", task_tree.filtered(&default_filter));
         }
         Commands::Purge => {
             task_tree.purge()?;
@@ -214,7 +255,7 @@ fn main() -> Result<()> {
                     .unwrap()
                     .join("task-tracke-rs/tasks.json"),
             )?;
-            print!("{task_tree}");
+            print!("{}", task_tree.filtered(&default_filter));
         }
     }
 
