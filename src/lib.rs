@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone};
 use rand::random_range;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     cmp::max,
     fmt::{self, Write},
@@ -30,8 +30,51 @@ pub struct Task {
     pub repeat: Option<Duration>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub struct TaskId(Vec<U4>);
+
+/// A reversible change to a task tree. Applying an effect returns the effect that reverses it.
+#[derive(Serialize, Deserialize)]
+pub enum Effect {
+    /// Inserts a task. If `displaced` is set, the node at the task's parent position is first
+    /// moved down into a new subtree at that digit, making room for the task beside it.
+    Insert {
+        id: TaskId,
+        task: Task,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        displaced: Option<U4>,
+    },
+    /// Removes a task. If this leaves its parent subtree with a single child, that child
+    /// moves up to take the subtree's place.
+    Remove {
+        id: TaskId,
+    },
+    Start {
+        id: TaskId,
+        at: DateTime<Local>,
+    },
+    Unstart {
+        id: TaskId,
+    },
+    Complete {
+        id: TaskId,
+        at: DateTime<Local>,
+    },
+    Uncomplete {
+        id: TaskId,
+    },
+    Edit {
+        id: TaskId,
+        edit: TaskEdit,
+    },
+}
+
+/// The inverses of the steps a command took, in the order the steps happened.
+/// Applying a record reverses those steps, last first.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Record(Vec<Effect>);
 
 #[derive(Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
 pub enum TaskStatus {
@@ -54,13 +97,34 @@ pub enum StatusFilter {
 }
 
 /// A set of changes to apply to a task. Fields left as `None` are unchanged.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct TaskEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// `Some(None)` clears the due date.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
     pub due: Option<Option<DateTime<Local>>>,
     /// `Some(None)` clears the repeat.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
     pub repeat: Option<Option<Duration>>,
+}
+
+/// Deserialises a present field as `Some`, so that a `null` value becomes `Some(None)` rather
+/// than `None`. Absent fields fall back to `None` through `#[serde(default)]`.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Default)]
@@ -82,6 +146,22 @@ pub enum StatusError {
     TaskAlreadyCompleted,
     #[error("Attempted to postpone a task with no due date.")]
     PostponedTaskWithNoDueDate,
+    #[error("Task is not in progress.")]
+    TaskNotInProgress,
+    #[error("Task is not completed.")]
+    TaskNotCompleted,
+}
+
+#[derive(Debug, Error)]
+pub enum EffectError {
+    #[error(transparent)]
+    Retrieval(#[from] RetrievalError),
+    #[error(transparent)]
+    Status(#[from] StatusError),
+    #[error(transparent)]
+    InvalidTask(#[from] InvalidTaskError),
+    #[error("Cannot insert a task at '{0}'.")]
+    InvalidPosition(TaskId),
 }
 
 #[derive(Debug, Error)]
@@ -208,36 +288,9 @@ impl TaskTree {
         }
     }
 
-    pub fn add_task(&mut self, task: Task) {
-        let position = random_range(0..16);
-
-        match self.children[position].take() {
-            None => {
-                self.children[position] = Some(TaskTreeNode::Task(task));
-            }
-            Some(TaskTreeNode::Tree(mut tree)) => {
-                tree.add_task(task);
-                self.children[position] = Some(TaskTreeNode::Tree(tree));
-            }
-            Some(TaskTreeNode::Task(other_task)) => {
-                let mut child_tree = TaskTree::new();
-                child_tree.add_task(other_task);
-                child_tree.add_task(task);
-                self.children[position] = Some(TaskTreeNode::Tree(Box::new(child_tree)));
-            }
-        }
-    }
-
-    /// Deletes the task associated with the provided id, then optimises the tree. Returns the deleted task.
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error if:
-    /// - The provided ID does not exist.
-    pub fn delete_task(&mut self, id: &[U4]) -> Result<Task, RetrievalError> {
-        let task = self.delete_task_inner(id)?;
-        self.optimise();
-        Ok(task)
+    /// Adds a task at a random free position.
+    pub fn add_task(&mut self, task: Task) -> Record {
+        Record(vec![self.insert_random(task)])
     }
 
     /// Deletes the task associated with the provided id.
@@ -246,12 +299,219 @@ impl TaskTree {
     ///
     /// This function will return an error if:
     /// - The provided ID does not exist.
-    pub fn delete_task_inner(&mut self, id: &[U4]) -> Result<Task, RetrievalError> {
-        self.remove(id)
-            .ok_or_else(|| RetrievalError::no_such_id(id))
+    pub fn delete_task(&mut self, id: &[U4]) -> Result<Record, EffectError> {
+        let inverse = self.apply(Effect::Remove { id: id.into() })?;
+        Ok(Record(vec![inverse]))
     }
 
-    fn remove(&mut self, id: &[U4]) -> Option<Task> {
+    /// Starts the task associated with the provided id.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The provided ID does not exist.
+    /// - The task is already in progress or completed.
+    pub fn start_task(&mut self, id: &[U4]) -> Result<Record, EffectError> {
+        let inverse = self.apply(Effect::Start {
+            id: id.into(),
+            at: Local::now(),
+        })?;
+        Ok(Record(vec![inverse]))
+    }
+
+    /// Completes the task associated with the provided id.
+    /// Adds the task's next occurrence if it is recurring.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The provided ID does not exist.
+    /// - The task is already completed.
+    pub fn complete_task(&mut self, id: &[U4]) -> Result<Record, EffectError> {
+        let next = self.get_task(id)?.next_occurrence();
+        let mut record = Record(vec![self.apply(Effect::Complete {
+            id: id.into(),
+            at: Local::now(),
+        })?]);
+
+        if let Some(next) = next {
+            record.0.push(self.insert_random(next));
+        }
+
+        Ok(record)
+    }
+
+    /// Postpones the task associated with the provided id. See [`Task::postponed_due`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The provided ID does not exist.
+    /// - The task has no due date.
+    pub fn postpone_task(&mut self, id: &[U4], duration: Duration) -> Result<Record, EffectError> {
+        let due = self.get_task(id)?.postponed_due(duration)?;
+        self.edit_task(
+            id,
+            TaskEdit {
+                due: Some(Some(due)),
+                ..TaskEdit::default()
+            },
+        )
+    }
+
+    /// Applies the given changes to the task associated with the provided id.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The provided ID does not exist.
+    /// - The edit is rejected. See [`Task::edit`].
+    pub fn edit_task(&mut self, id: &[U4], edit: TaskEdit) -> Result<Record, EffectError> {
+        let inverse = self.apply(Effect::Edit {
+            id: id.into(),
+            edit,
+        })?;
+        Ok(Record(vec![inverse]))
+    }
+
+    /// Applies a record, returning the record that reverses it.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - Any effect is rejected. Effects applied before it are not rolled back.
+    pub fn apply_record(&mut self, record: Record) -> Result<Record, EffectError> {
+        let mut inverse = record
+            .0
+            .into_iter()
+            .rev()
+            .map(|effect| self.apply(effect))
+            .collect::<Result<Vec<_>, _>>()?;
+        // The inverses were produced last step first, but a record lists steps in the order they happened.
+        inverse.reverse();
+        Ok(Record(inverse))
+    }
+
+    /// Applies an effect, returning the effect that reverses it.
+    /// The tree is left unchanged if the effect is rejected.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The effect refers to a task that does not exist.
+    /// - The effect inserts at a position that is occupied or unreachable.
+    /// - The task is not in the status the effect expects.
+    /// - The edit is rejected. See [`Task::edit`].
+    pub fn apply(&mut self, effect: Effect) -> Result<Effect, EffectError> {
+        Ok(match effect {
+            Effect::Insert {
+                id,
+                task,
+                displaced,
+            } => {
+                if self.insert(id.as_ref(), task, displaced).is_err() {
+                    return Err(EffectError::InvalidPosition(id));
+                }
+                Effect::Remove { id }
+            }
+            Effect::Remove { id } => {
+                let (task, displaced) = self
+                    .remove(id.as_ref())
+                    .ok_or_else(|| RetrievalError::no_such_id(id.as_ref()))?;
+                Effect::Insert {
+                    id,
+                    task,
+                    displaced,
+                }
+            }
+            Effect::Start { id, at } => {
+                self.get_task_mut(id.as_ref())?.start(at)?;
+                Effect::Unstart { id }
+            }
+            Effect::Unstart { id } => {
+                let at = self.get_task_mut(id.as_ref())?.unstart()?;
+                Effect::Start { id, at }
+            }
+            Effect::Complete { id, at } => {
+                self.get_task_mut(id.as_ref())?.complete(at)?;
+                Effect::Uncomplete { id }
+            }
+            Effect::Uncomplete { id } => {
+                let at = self.get_task_mut(id.as_ref())?.uncomplete()?;
+                Effect::Complete { id, at }
+            }
+            Effect::Edit { id, edit } => {
+                let edit = self.get_task_mut(id.as_ref())?.edit(edit)?;
+                Effect::Edit { id, edit }
+            }
+        })
+    }
+
+    fn insert_random(&mut self, task: Task) -> Effect {
+        let (id, displaced) = self.random_free_position();
+        self.apply(Effect::Insert {
+            id,
+            task,
+            displaced,
+        })
+        .unwrap_or_else(|_| unreachable!("Position was just chosen as free."))
+    }
+
+    /// Picks a random position for a new task. If it lands on an existing task, that task is
+    /// displaced to one digit of a new subtree and the new task takes a different one, so
+    /// every subtree keeps at least two children.
+    fn random_free_position(&self) -> (TaskId, Option<U4>) {
+        let mut id = TaskId::new();
+        let mut tree = self;
+
+        loop {
+            let index = random_range(0..16);
+            id.push(digit(index));
+
+            match &tree.children[index] {
+                None => return (id, None),
+                Some(TaskTreeNode::Tree(child)) => tree = child,
+                Some(TaskTreeNode::Task(_)) => {
+                    let displaced = random_range(0..16);
+                    id.push(digit((displaced + random_range(1..16)) % 16));
+                    return (id, Some(digit(displaced)));
+                }
+            }
+        }
+    }
+
+    /// Inserts a task at the given position, as described by [`Effect::Insert`].
+    /// Returns the task if the position is occupied or unreachable.
+    fn insert(&mut self, id: &[U4], task: Task, displaced: Option<U4>) -> Result<(), Task> {
+        let Some((&index, rest)) = id.split_first() else {
+            return Err(task);
+        };
+        let slot = &mut self.children[usize::from(index)];
+
+        match (rest, displaced) {
+            ([], None) if slot.is_none() => {
+                *slot = Some(TaskTreeNode::Task(task));
+                Ok(())
+            }
+            ([last], Some(displaced)) if slot.is_some() && *last != displaced => {
+                let mut tree = TaskTree::new();
+                tree.children[usize::from(displaced)] = slot.take();
+                tree.children[usize::from(*last)] = Some(TaskTreeNode::Task(task));
+                *slot = Some(TaskTreeNode::Tree(Box::new(tree)));
+                Ok(())
+            }
+            _ => match slot {
+                Some(TaskTreeNode::Tree(tree)) if !rest.is_empty() => {
+                    tree.insert(rest, task, displaced)
+                }
+                _ => Err(task),
+            },
+        }
+    }
+
+    /// Removes the task at the given position, as described by [`Effect::Remove`].
+    /// Returns the task, and the old digit of the child that moved up, if any.
+    fn remove(&mut self, id: &[U4]) -> Option<(Task, Option<U4>)> {
         let (&index, rest) = id.split_first()?;
         let slot = &mut self.children[usize::from(index)];
 
@@ -260,13 +520,34 @@ impl TaskTree {
                 let Some(TaskTreeNode::Task(task)) = slot.take() else {
                     unreachable!("Slot was just matched as a task.");
                 };
-                Some(task)
+                Some((task, None))
             }
-            Some(TaskTreeNode::Tree(tree)) if !rest.is_empty() => tree.remove(rest),
+            Some(TaskTreeNode::Tree(tree)) if !rest.is_empty() => {
+                let (task, displaced) = tree.remove(rest)?;
+                // Only the removed task's direct parent can be left with a single child.
+                if rest.len() > 1 {
+                    return Some((task, displaced));
+                }
+
+                let mut remaining = tree
+                    .children
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, child)| child.as_ref().map(|_| i));
+                let (Some(only), None) = (remaining.next(), remaining.next()) else {
+                    return Some((task, None));
+                };
+
+                let child = tree.children[only].take();
+                *slot = child;
+                Some((task, Some(digit(only))))
+            }
             _ => None,
         }
     }
 
+    /// Collapses every subtree with fewer than two children. Trees built through [`Effect`]s
+    /// are always in this form, so this is only needed for trees saved by older versions.
     pub fn optimise(&mut self) {
         for i in 0..self.children.len() {
             let Some(TaskTreeNode::Tree(tree)) = self.children[i].as_mut() else {
@@ -415,43 +696,14 @@ impl TaskTree {
                 continue;
             };
 
-            debug_assert!(i < 16);
-            let index =
-                u4::U4::try_from(i).unwrap_or_else(|_| unreachable!("Array is of length 16."));
-
             let mut id = prefix.clone();
-            id.push(index);
+            id.push(digit(i));
 
             match child {
                 TaskTreeNode::Task(task) => tasks.push((id, task)),
                 TaskTreeNode::Tree(tree) => tasks.extend(tree.collect_tasks(&id)),
             }
         }
-
-        tasks
-    }
-
-    /// Purges all completed tasks.
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error if:
-    /// - A completed task cannot be found while deleting it. This indicates a bug, as the ids
-    ///   are collected from the tree immediately beforehand.
-    pub fn purge(&mut self) -> Result<Vec<Task>, RetrievalError> {
-        let ids: Vec<TaskId> = self
-            .collect_tasks(&TaskId::new())
-            .into_iter()
-            .filter(|(_, task)| matches!(task.status, TaskStatus::Complete(_, _)))
-            .map(|(id, _)| id)
-            .collect();
-
-        let tasks = ids
-            .into_iter()
-            .map(|id| self.delete_task_inner(id.as_ref()))
-            .collect();
-
-        self.optimise();
 
         tasks
     }
@@ -498,10 +750,10 @@ impl Task {
     /// This function will return an error if:
     /// - The task is already in progress.
     /// - The task is already completed.
-    pub fn start_task(&mut self) -> Result<(), StatusError> {
+    fn start(&mut self, at: DateTime<Local>) -> Result<(), StatusError> {
         match self.status {
             TaskStatus::Incomplete => {
-                self.status = TaskStatus::InProgress(Local::now());
+                self.status = TaskStatus::InProgress(at);
                 Ok(())
             }
             TaskStatus::InProgress(_) => Err(StatusError::TaskAlreadyStarted),
@@ -509,42 +761,72 @@ impl Task {
         }
     }
 
-    /// Sets status to `Complete`.
-    /// Will generate a new task if the task is recurring.
+    /// Sets `status` from `InProgress` back to `Incomplete`. Returns when the task was started.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The task is not in progress.
+    fn unstart(&mut self) -> Result<DateTime<Local>, StatusError> {
+        match self.status {
+            TaskStatus::InProgress(at) => {
+                self.status = TaskStatus::Incomplete;
+                Ok(at)
+            }
+            _ => Err(StatusError::TaskNotInProgress),
+        }
+    }
+
+    /// Sets `status` to `Complete`.
     ///
     /// # Errors
     ///
     /// This function will return an error if:
     /// - The task is already completed.
-    pub fn complete_task(&mut self) -> Result<Option<Task>, StatusError> {
-        let next = if let (Some(recurrence), Some(due_date)) = (self.repeat, self.due) {
-            // Built directly rather than via `Task::new`, so that tasks saved before
-            // validation existed can still be completed.
-            Some(Task {
-                creation_date: Local::now(),
-                due: Some(due_date + recurrence),
-                name: self.name.clone(),
-                status: TaskStatus::Incomplete,
-                repeat: self.repeat,
-            })
-        } else {
-            None
+    fn complete(&mut self, at: DateTime<Local>) -> Result<(), StatusError> {
+        self.status = match self.status {
+            TaskStatus::Incomplete => TaskStatus::Complete(None, at),
+            TaskStatus::InProgress(start_time) => TaskStatus::Complete(Some(start_time), at),
+            TaskStatus::Complete(_, _) => return Err(StatusError::TaskAlreadyCompleted),
         };
+        Ok(())
+    }
 
+    /// Restores `status` to what it was before completion. Returns when the task was completed.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - The task is not completed.
+    fn uncomplete(&mut self) -> Result<DateTime<Local>, StatusError> {
         match self.status {
-            TaskStatus::Incomplete => {
-                self.status = TaskStatus::Complete(None, Local::now());
-                Ok(next)
+            TaskStatus::Complete(start_time, at) => {
+                self.status = start_time.map_or(TaskStatus::Incomplete, TaskStatus::InProgress);
+                Ok(at)
             }
-            TaskStatus::InProgress(start_time) => {
-                self.status = TaskStatus::Complete(Some(start_time), Local::now());
-                Ok(next)
-            }
-            TaskStatus::Complete(_, _) => Err(StatusError::TaskAlreadyCompleted),
+            _ => Err(StatusError::TaskNotCompleted),
         }
     }
 
-    /// Postpones a task by the given duration.
+    /// Returns the next occurrence of a recurring task, or `None` if it does not repeat.
+    #[must_use]
+    pub fn next_occurrence(&self) -> Option<Task> {
+        let (Some(recurrence), Some(due_date)) = (self.repeat, self.due) else {
+            return None;
+        };
+
+        // Built directly rather than via `Task::new`, so that tasks saved before
+        // validation existed can still be completed.
+        Some(Task {
+            creation_date: Local::now(),
+            due: Some(due_date + recurrence),
+            name: self.name.clone(),
+            status: TaskStatus::Incomplete,
+            repeat: self.repeat,
+        })
+    }
+
+    /// Returns the due date after postponing by the given duration.
     /// If the due date is in the past, it will postpone relative to current time.
     /// If the due date is in the future, it will postpone relative to due date.
     ///
@@ -552,23 +834,21 @@ impl Task {
     ///
     /// This function will return an error if:
     /// - The task has no due date.
-    pub fn postpone_task(&mut self, duration: chrono::TimeDelta) -> Result<(), StatusError> {
-        if let Some(due) = self.due {
-            self.due = Some(max(due, Local::now()) + duration);
-            Ok(())
-        } else {
-            Err(StatusError::PostponedTaskWithNoDueDate)
-        }
+    pub fn postponed_due(&self, duration: Duration) -> Result<DateTime<Local>, StatusError> {
+        self.due
+            .map(|due| max(due, Local::now()) + duration)
+            .ok_or(StatusError::PostponedTaskWithNoDueDate)
     }
 
-    /// Applies the given changes to the task. The task is left unchanged if the edit is rejected.
+    /// Applies the given changes to the task, returning the edit that reverses them.
+    /// The task is left unchanged if the edit is rejected.
     ///
     /// # Errors
     ///
     /// This function will return an error if:
     /// - The edited task would repeat without a due date.
     /// - The new name is empty or only whitespace.
-    pub fn edit(&mut self, edit: TaskEdit) -> Result<(), InvalidTaskError> {
+    pub fn edit(&mut self, edit: TaskEdit) -> Result<TaskEdit, InvalidTaskError> {
         if let Some(name) = &edit.name {
             validate_name(name)?;
         }
@@ -579,13 +859,15 @@ impl Task {
             return Err(InvalidTaskError::RepeatWithoutDueDate);
         }
 
-        if let Some(name) = edit.name {
-            self.name = name;
-        }
-        self.due = due;
-        self.repeat = repeat;
-
-        Ok(())
+        Ok(TaskEdit {
+            name: edit
+                .name
+                .map(|name| std::mem::replace(&mut self.name, name)),
+            due: edit.due.map(|_| std::mem::replace(&mut self.due, due)),
+            repeat: edit
+                .repeat
+                .map(|_| std::mem::replace(&mut self.repeat, repeat)),
+        })
     }
 }
 
@@ -690,6 +972,31 @@ impl FromStr for TaskId {
             .map(Self)
             .ok_or_else(|| ParseTaskIdError(s.to_owned()))
     }
+}
+
+impl From<&[U4]> for TaskId {
+    fn from(id: &[U4]) -> Self {
+        Self(id.to_vec())
+    }
+}
+
+impl From<TaskId> for String {
+    fn from(id: TaskId) -> Self {
+        id.to_string()
+    }
+}
+
+impl TryFrom<String> for TaskId {
+    type Error = ParseTaskIdError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+/// Converts a child index into an id digit.
+fn digit(index: usize) -> U4 {
+    U4::try_from(index).unwrap_or_else(|_| unreachable!("Child indices are below 16."))
 }
 
 impl RetrievalError {
